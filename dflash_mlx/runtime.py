@@ -111,6 +111,21 @@ def greedy_tokens_with_mask(
     return mx.argmax(masked_logits, axis=-1).astype(mx.uint32)
 
 
+def sample_with_temperature(
+    logits: mx.array,
+    temperature: float,
+    suppress_token_mask: Optional[mx.array] = None,
+) -> mx.array:
+    """Sample tokens with temperature. Falls back to greedy when temperature <= 0."""
+    if temperature < 1e-5:
+        return greedy_tokens_with_mask(logits, suppress_token_mask)
+    if suppress_token_mask is not None:
+        floor = mx.array(-1e9, dtype=logits.dtype)
+        logits = mx.where(suppress_token_mask, floor, logits)
+    scaled = logits / temperature
+    return mx.random.categorical(scaled).astype(mx.uint32)
+
+
 def _match_acceptance_length(
     drafted_tokens: mx.array,
     posterior_tokens: mx.array,
@@ -1111,6 +1126,7 @@ def generate_dflash_once(
     suppress_token_ids: Optional[list[int]] = None,
     prompt_tokens_override: Optional[list[int]] = None,
     quantize_kv_cache: bool = False,
+    temperature: float = 0.0,
 ) -> dict[str, Any]:
     if hasattr(mx, "reset_peak_memory"):
         try:
@@ -1211,7 +1227,7 @@ def generate_dflash_once(
         prefill_ns = time.perf_counter_ns() - prefill_start_ns
 
         suppress_token_mask = build_suppress_token_mask(int(prefill_logits.shape[-1]), suppress_token_ids)
-        staged_first = greedy_tokens_with_mask(prefill_logits[:, -1, :], suppress_token_mask).reshape(-1)
+        staged_first = sample_with_temperature(prefill_logits[:, -1, :], temperature, suppress_token_mask).reshape(-1)
         target_hidden = (
             target_hidden_chunks[0]
             if len(target_hidden_chunks) == 1
@@ -1274,7 +1290,7 @@ def generate_dflash_once(
                 draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
                 mx.async_eval(draft_logits)
                 mx.eval(draft_logits)
-                drafted = greedy_tokens_with_mask(draft_logits, suppress_token_mask).squeeze(0)
+                drafted = sample_with_temperature(draft_logits, temperature, suppress_token_mask).squeeze(0)
                 block_token_ids[1:block_len] = drafted
                 draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
                 draft_ns_total += draft_cycle_ns
@@ -1302,7 +1318,7 @@ def generate_dflash_once(
             verify_ns_total += verify_cycle_ns
 
             acceptance_start_ns = time.perf_counter_ns()
-            posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
+            posterior = sample_with_temperature(verify_logits[0], temperature, suppress_token_mask)
             acceptance_len = int(
                 _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
             )
@@ -1446,6 +1462,7 @@ def stream_dflash_generate(
     suppress_token_ids: Optional[list[int]] = None,
     prompt_tokens_override: Optional[list[int]] = None,
     quantize_kv_cache: bool = False,
+    temperature: float = 0.0,
 ) -> Iterator[dict[str, Any]]:
     if quantize_kv_cache:
         configure_full_attention_split(target_model, enabled=False)
@@ -1526,7 +1543,7 @@ def stream_dflash_generate(
         prefill_ns = time.perf_counter_ns() - prefill_start_ns
 
         suppress_token_mask = build_suppress_token_mask(int(prefill_logits.shape[-1]), suppress_token_ids)
-        staged_first = greedy_tokens_with_mask(prefill_logits[:, -1, :], suppress_token_mask).reshape(-1)
+        staged_first = sample_with_temperature(prefill_logits[:, -1, :], temperature, suppress_token_mask).reshape(-1)
         target_hidden = (
             target_hidden_chunks[0]
             if len(target_hidden_chunks) == 1
@@ -1593,7 +1610,7 @@ def stream_dflash_generate(
                 draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
                 mx.async_eval(draft_logits)
                 mx.eval(draft_logits)
-                drafted = greedy_tokens_with_mask(draft_logits, suppress_token_mask).squeeze(0)
+                drafted = sample_with_temperature(draft_logits, temperature, suppress_token_mask).squeeze(0)
                 block_token_ids[1:block_len] = drafted
                 draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
                 draft_ns_total += draft_cycle_ns
@@ -1620,7 +1637,7 @@ def stream_dflash_generate(
             verify_ns_total += verify_cycle_ns
 
             acceptance_start_ns = time.perf_counter_ns()
-            posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
+            posterior = sample_with_temperature(verify_logits[0], temperature, suppress_token_mask)
             acceptance_len = int(
                 _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
             )
