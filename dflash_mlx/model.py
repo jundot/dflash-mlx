@@ -149,27 +149,18 @@ class DFlashAttention(nn.Module):
             0, 2, 1, 3
         )
 
-        context_keys = self.k_proj(target_hidden)
-        context_keys = self.k_norm(
-            context_keys.reshape(batch, ctx_len, self.n_kv_heads, -1)
+        # Fuse context and noise projections: 2 matmuls instead of 4
+        kv_states = mx.concatenate([target_hidden, hidden_states], axis=1)
+        all_keys = self.k_norm(
+            self.k_proj(kv_states).reshape(batch, ctx_len + block_len, self.n_kv_heads, -1)
         ).transpose(0, 2, 1, 3)
-        context_values = self.v_proj(target_hidden).reshape(
-            batch,
-            ctx_len,
-            self.n_kv_heads,
-            -1,
+        all_values = self.v_proj(kv_states).reshape(
+            batch, ctx_len + block_len, self.n_kv_heads, -1
         ).transpose(0, 2, 1, 3)
-
-        noise_keys = self.k_proj(hidden_states)
-        noise_keys = self.k_norm(
-            noise_keys.reshape(batch, block_len, self.n_kv_heads, -1)
-        ).transpose(0, 2, 1, 3)
-        noise_values = self.v_proj(hidden_states).reshape(
-            batch,
-            block_len,
-            self.n_kv_heads,
-            -1,
-        ).transpose(0, 2, 1, 3)
+        context_keys = all_keys[:, :, :ctx_len, :]
+        context_values = all_values[:, :, :ctx_len, :]
+        noise_keys = all_keys[:, :, ctx_len:, :]
+        noise_values = all_values[:, :, ctx_len:, :]
 
         if cache is not None:
             if isinstance(cache, ContextOnlyDraftKVCache):
