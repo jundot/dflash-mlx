@@ -303,12 +303,32 @@ class _ExactSmallProjPad(nn.Module):
         return self.linear(x)
 
 
+def _is_qwen3_next_layout(linear_attn: Any) -> bool:
+    """Return True if ``linear_attn`` uses the Qwen3-Next GatedDeltaNet layout.
+
+    Qwen3-Next fuses (q,k,v,z) into a single ``in_proj_qkvz`` Linear and
+    (b,a) into a single ``in_proj_ba`` Linear, then splits them with the
+    ``fix_query_key_value_ordering`` helper. Qwen3.5 instead keeps four
+    separate projections (in_proj_qkv / in_proj_z / in_proj_b / in_proj_a).
+    """
+    return (
+        hasattr(linear_attn, "in_proj_qkvz")
+        and hasattr(linear_attn, "in_proj_ba")
+        and hasattr(linear_attn, "fix_query_key_value_ordering")
+    )
+
+
 def _install_exact_small_proj_hooks(
     linear_attn: Any,
     *,
     pad_m: int = _EXACT_SMALL_PROJ_PAD_M,
 ) -> None:
-    for attr_name in ("in_proj_b", "in_proj_a"):
+    # Qwen3-Next fuses b+a into ``in_proj_ba``; Qwen3.5 keeps them split.
+    if _is_qwen3_next_layout(linear_attn):
+        attr_names = ("in_proj_ba",)
+    else:
+        attr_names = ("in_proj_b", "in_proj_a")
+    for attr_name in attr_names:
         proj = getattr(linear_attn, attr_name, None)
         if proj is None or getattr(proj, "_dflash_exact_small_proj_wrapped", False):
             continue
@@ -378,11 +398,57 @@ def pack_target_model_weights_selective(
     return pack_info
 
 
+def _project_inputs_qwen3_5(
+    linear_attn: Any, inputs: mx.array, B: int, S: int
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    """Run the four split projections of a Qwen3.5 GatedDeltaNet.
+
+    Returns ``(qkv, z, b, a)`` with shapes ``(B, S, conv_dim)``,
+    ``(B, S, num_v_heads, head_v_dim)``, ``(B, S, num_v_heads)``,
+    ``(B, S, num_v_heads)`` respectively.
+    """
+    qkv = linear_attn.in_proj_qkv(inputs)
+    z = linear_attn.in_proj_z(inputs).reshape(
+        B, S, linear_attn.num_v_heads, linear_attn.head_v_dim
+    )
+    b = linear_attn.in_proj_b(inputs)
+    a = linear_attn.in_proj_a(inputs)
+    return qkv, z, b, a
+
+
+def _project_inputs_qwen3_next(
+    linear_attn: Any, inputs: mx.array, B: int, S: int
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    """Run the fused Qwen3-Next projections and reshape to the shared layout.
+
+    Qwen3-Next computes (q,k,v,z) from a single ``in_proj_qkvz`` and
+    (b,a) from a single ``in_proj_ba``, then splits them via
+    ``fix_query_key_value_ordering``. We then re-flatten q,k,v back into
+    a single ``qkv`` tensor so the rest of the speculative_call body can
+    treat both layouts identically (and so the cache's ``_tape_qkv``
+    snapshot stays meaningful for ``_rebuild_conv_state``).
+    """
+    q, k, v, z, b, a = linear_attn.fix_query_key_value_ordering(
+        linear_attn.in_proj_qkvz(inputs),
+        linear_attn.in_proj_ba(inputs),
+    )
+    qkv = mx.concatenate(
+        [q.reshape(B, S, -1), k.reshape(B, S, -1), v.reshape(B, S, -1)],
+        axis=-1,
+    )
+    return qkv, z, b, a
+
+
 def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
     cls = type(linear_attn)
     if getattr(cls, "_dflash_speculative_call_installed", False):
         return
 
+    project_inputs = (
+        _project_inputs_qwen3_next
+        if _is_qwen3_next_layout(linear_attn)
+        else _project_inputs_qwen3_5
+    )
     original_call = cls.__call__
 
     def speculative_call(
@@ -402,11 +468,7 @@ def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
         if sharding_group is not None:
             inputs = sum_gradients(sharding_group)(inputs)
 
-        qkv = self.in_proj_qkv(inputs)
-        z_proj = self.in_proj_z(inputs)
-        z = z_proj.reshape(B, S, self.num_v_heads, self.head_v_dim)
-        b = self.in_proj_b(inputs)
-        a = self.in_proj_a(inputs)
+        qkv, z, b, a = project_inputs(self, inputs, B, S)
 
         if cache[0] is not None:
             conv_state = cache[0]
