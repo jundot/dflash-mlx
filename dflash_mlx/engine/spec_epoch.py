@@ -27,7 +27,7 @@ from dflash_mlx.cache.snapshot import (
     validate_prefix_snapshot as _validate_prefix_snapshot,
 )
 from dflash_mlx.draft_backend import DraftBackend
-from dflash_mlx.engine.acceptance import match_acceptance_length as _match_acceptance_length
+from dflash_mlx.engine.acceptance import match_acceptance_length_host
 from dflash_mlx.engine.copyspec import CopySpecAutoGate, CopySpecIndex
 from dflash_mlx.engine.ddtree import (
     build_flat_ddtree,
@@ -1938,7 +1938,7 @@ class SpeculativeSession:
         prompt_len = request.prompt_len
         max_new_tokens = request.max_new_tokens
         block_tokens = request.block_tokens
-        stop_token_array = request.stop_token_array
+        stop_token_id_set = set(request.stop_token_ids)
         feature_store = prefill.feature_store
         suppress_token_mask = prefill.suppress_token_mask
         supports_prefix_snapshot = prefill.supports_prefix_snapshot
@@ -1961,12 +1961,14 @@ class SpeculativeSession:
             )
 
         first_token_yielded = False
+        staged_first_id = 0
         if max_new_tokens > 0:
             first_token_yielded = True
             assert state.staged_first is not None
+            staged_first_id = int(state.staged_first.item())
             _pre_yield = yield_pause.mark()
             yield TokenEvent(
-                token_id=int(state.staged_first.item()),
+                token_id=staged_first_id,
                 generated_tokens=1,
                 acceptance_ratio=0.0,
                 cycles_completed=0,
@@ -2012,14 +2014,14 @@ class SpeculativeSession:
         )
 
         def _copy_draft_for_block(
-            staged_first: mx.array,
+            staged_first_token: int,
             block_len: int,
             draft_context: mx.array,
         ) -> mx.array | None:
             if self.copyspec_mode == "off" or state.copyspec_disabled:
                 return None
             candidate = self.copyspec_index.draft_after(
-                int(staged_first.item()),
+                staged_first_token,
                 max_tokens=max(0, int(block_len) - 1),
                 forbidden_tokens=forbidden_copy_tokens,
             )
@@ -2084,11 +2086,17 @@ class SpeculativeSession:
                 else effective_block_tokens
             )
             block_len = max(1, min(effective_block_tokens, block_limit, remaining))
-            block_token_buffer[:block_len] = int(draft_model.mask_token_id)
             assert state.staged_first is not None
-            block_token_buffer[:1] = state.staged_first
-            block_token_ids = block_token_buffer[:block_len]
+            # The buffer feeds verify_token_ids only on these paths; writing it
+            # unconditionally would enqueue two dead scatters per fast cycle.
+            if profile_cycles or block_len <= 1:
+                block_token_buffer[:block_len] = int(draft_model.mask_token_id)
+                block_token_buffer[:1] = state.staged_first
+                block_token_ids = block_token_buffer[:block_len]
+            else:
+                block_token_ids = None
             current_staged_first = state.staged_first
+            current_staged_first_id = staged_first_id
             drafted = None
             draft_source = "none"
             copyspec_tokens = 0
@@ -2101,7 +2109,7 @@ class SpeculativeSession:
                 if profile_cycles:
                     draft_start_ns = time.perf_counter_ns()
                     drafted = _copy_draft_for_block(
-                        current_staged_first,
+                        current_staged_first_id,
                         block_len,
                         feature_store.require_current_hidden(),
                     )
@@ -2149,11 +2157,14 @@ class SpeculativeSession:
                     ):
                         drafted = state.prefetched_draft["drafted"]
                         current_staged_first = state.prefetched_draft["staged_first"]
+                        current_staged_first_id = int(
+                            state.prefetched_draft["staged_first_id"]
+                        )
                         draft_source = str(state.prefetched_draft["source"])
                     else:
                         draft_start_ns = time.perf_counter_ns()
                         drafted = _copy_draft_for_block(
-                            current_staged_first,
+                            current_staged_first_id,
                             block_len,
                             feature_store.require_current_hidden(),
                         )
@@ -2248,10 +2259,15 @@ class SpeculativeSession:
                         width=2,
                     )
                 )
-            if not profile_cycles:
-                mx.async_eval(posterior)
-            acceptance_len = int(
-                _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
+            # Single device-to-host transfer per cycle (same pattern as the
+            # ddtree path): acceptance matching, commit ids, the next staged
+            # token and the stop check all run on these host ints.
+            verify_id_count = int(verify_token_ids.shape[0])
+            transferred = mx.concatenate([verify_token_ids, posterior]).tolist()
+            verify_ids_host = [int(t) for t in transferred[:verify_id_count]]
+            posterior_host = [int(t) for t in transferred[verify_id_count:]]
+            acceptance_len = match_acceptance_length_host(
+                verify_ids_host[1:], posterior_host[:-1]
             )
             state.acceptance_history.append(acceptance_len)
             if profile_cycles:
@@ -2277,14 +2293,18 @@ class SpeculativeSession:
                 hidden_extract_cycle_ns = time.perf_counter_ns() - hidden_extract_start_ns
 
             commit_count = 1 + acceptance_len
-            committed_segment = verify_token_ids[:commit_count]
+            committed_ids = verify_ids_host[:commit_count]
             commit_start_ns = time.perf_counter_ns()
             state.start += commit_count
             feature_store.commit_generation(
                 committed_hidden,
                 collect_snapshot=collect_generation_snapshot_hidden,
             )
-            state.last_cycle_logits = verify_logits[:, acceptance_len, :]
+            if collect_generation_snapshot_hidden:
+                # Only the generation-snapshot publish reads these; retaining
+                # the slice otherwise pins the full (1, k+1, V) logits graph
+                # for the whole request.
+                state.last_cycle_logits = verify_logits[:, acceptance_len, :]
             commit_cycle_ns = time.perf_counter_ns() - commit_start_ns
             replay_cycle_ns = target_ops.restore_after_acceptance(
                 target_cache,
@@ -2318,6 +2338,7 @@ class SpeculativeSession:
                 if self.copyspec_mode == "conservative" and acceptance_len == 0:
                     state.copyspec_disabled = True
             staged_first_next = posterior[acceptance_len : acceptance_len + 1]
+            staged_first_next_id = posterior_host[acceptance_len]
             if adaptive_block_policy is not None or copyspec_auto_gate is not None:
                 cycle_wall_ns = time.perf_counter_ns() - cycle_start_ns
                 cycle_pause_ns = max(0, yield_pause.pause_ns - cycle_pause_start_ns)
@@ -2355,7 +2376,6 @@ class SpeculativeSession:
                         acceptance_len=acceptance_len,
                         cycle_cost_ns=adaptive_cycle_cost_ns,
                     )
-            committed_ids = [int(token_id) for token_id in committed_segment.tolist()]
             self.copyspec_index.append_committed(committed_ids)
             if not profile_cycles:
                 next_remaining = max_new_tokens - len(state.generated_token_ids) - commit_count
@@ -2372,7 +2392,7 @@ class SpeculativeSession:
                     draft_start_ns = time.perf_counter_ns()
                     next_source = "copyspec"
                     next_drafted = _copy_draft_for_block(
-                        staged_first_next,
+                        staged_first_next_id,
                         next_block_len,
                         feature_store.require_current_hidden(),
                     )
@@ -2396,6 +2416,7 @@ class SpeculativeSession:
                     state.prefetched_draft = {
                         "block_len": next_block_len,
                         "staged_first": staged_first_next,
+                        "staged_first_id": staged_first_next_id,
                         "drafted": next_drafted,
                         "source": next_source,
                     }
@@ -2439,19 +2460,15 @@ class SpeculativeSession:
                 yield_pause.done(_pre_yield)
 
             stop_hit = False
-            if stop_token_array is not None:
-                stop_hit = bool(
-                    mx.any(
-                        mx.equal(
-                            committed_segment[:, None],
-                            stop_token_array[None, :],
-                        )
-                    ).item()
+            if stop_token_id_set:
+                stop_hit = any(
+                    token_id in stop_token_id_set for token_id in committed_ids
                 )
             if stop_hit:
                 break
 
             state.staged_first = staged_first_next
+            staged_first_id = staged_first_next_id
 
             if profile_cycles:
                 cycle_wall_ns = time.perf_counter_ns() - cycle_start_ns
@@ -2485,9 +2502,9 @@ class SpeculativeSession:
                     verify_token_count=int(verify_token_count),
                     draft_source=str(draft_source),
                     candidate_count=1,
-                    proposed_ids=tuple(int(t) for t in verify_token_ids.tolist()),
-                    posterior_ids=tuple(int(t) for t in posterior.tolist()),
-                    committed_ids=tuple(int(t) for t in committed_ids),
+                    proposed_ids=tuple(verify_ids_host),
+                    posterior_ids=tuple(posterior_host),
+                    committed_ids=tuple(committed_ids),
                     draft_topk_ids=(
                         _capture_rows_int(draft_topk_ids_arr)
                         if draft_topk_ids_arr is not None

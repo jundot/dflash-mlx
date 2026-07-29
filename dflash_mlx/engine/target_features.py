@@ -124,5 +124,7 @@ class TargetFeatureStore:
         if self.project_context is None:
             return features
         projected = self.project_context(features)
-        mx.eval(projected)
+        # Materialize without blocking: commit_generation calls this on every
+        # decode cycle, and a hard eval would stall the host mid-cycle.
+        mx.async_eval(projected)
         return projected
