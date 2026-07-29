@@ -14,3 +14,15 @@ def match_acceptance_length(
         return mx.array(0, dtype=mx.int32)
     matches = mx.equal(drafted_tokens, posterior_tokens).astype(mx.int32)
     return mx.sum(mx.cumprod(matches, axis=0))
+
+
+def match_acceptance_length_host(
+    drafted_tokens: list[int],
+    posterior_tokens: list[int],
+) -> int:
+    accepted = 0
+    for drafted, posterior in zip(drafted_tokens, posterior_tokens):
+        if drafted != posterior:
+            break
+        accepted += 1
+    return accepted
