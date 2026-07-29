@@ -79,6 +79,7 @@ class DFlashPrefixCache:
     def _usable_sidecar_boundary(
         snap: DFlashPrefixSnapshot,
         req_tuple: tuple[int, ...],
+        require_full_coverage: bool = False,
     ) -> int:
         boundary = int(snap.sidecar_boundary)
         if boundary <= 0 or boundary > len(req_tuple):
@@ -87,7 +88,13 @@ class DFlashPrefixCache:
             return 0
         if req_tuple[:boundary] != snap.token_ids[:boundary]:
             return 0
-        if not snapshot_covers_prefix(snap, boundary):
+        # Full [0, boundary) feature coverage is only needed by full-context
+        # draft layers; windowed drafts never read the trimmed hole, so gate
+        # the check on the same flag the serving paths use. Unconditional
+        # coverage made the sidecar a dead path: it is only collected at
+        # boundary >= _SIDECAR_MIN_BOUNDARY, which always exceeds the
+        # sink+window trim threshold.
+        if require_full_coverage and not snapshot_covers_prefix(snap, boundary):
             return 0
         return boundary
 
@@ -120,7 +127,9 @@ class DFlashPrefixCache:
                     continue
                 snap_len = len(snap.token_ids)
                 if snap_len == 0 or snap_len > len(req_tuple):
-                    boundary = self._usable_sidecar_boundary(snap, req_tuple)
+                    boundary = self._usable_sidecar_boundary(
+                        snap, req_tuple, require_full_coverage
+                    )
                     if boundary > best_sidecar_len:
                         best_sidecar_len = boundary
                         best_sidecar_id = eid
@@ -136,7 +145,9 @@ class DFlashPrefixCache:
                     if common > longest_fingerprint_match_len:
                         longest_fingerprint_match_len = common
                         longest_fingerprint_first_divergence = common
-                    boundary = self._usable_sidecar_boundary(snap, req_tuple)
+                    boundary = self._usable_sidecar_boundary(
+                        snap, req_tuple, require_full_coverage
+                    )
                     if boundary > best_sidecar_len:
                         best_sidecar_len = boundary
                         best_sidecar_id = eid
@@ -155,7 +166,8 @@ class DFlashPrefixCache:
                 best_len = best_sidecar_len
                 best_id = best_sidecar_id
                 best_snapshot = slice_snapshot_at_sidecar_boundary(
-                    best_sidecar_carrier
+                    best_sidecar_carrier,
+                    require_full_coverage=require_full_coverage,
                 )
                 sidecar_used = True
 

@@ -1916,7 +1916,7 @@ class TestSidecar:
         )
         assert hydrated[0].offset == 5
 
-    def test_slice_rejects_uncovered_boundary(self):
+    def test_slice_uncovered_boundary_gated_on_full_coverage(self):
         key = _make_key()
         snap = _make_sidecar_generation_snapshot(list(range(1, 9)), 5, key)
         snap.target_hidden_chunks = (
@@ -1925,7 +1925,12 @@ class TestSidecar:
         )
         snap.target_hidden_chunk_spans = ((0, 2), (6, 8))
         with pytest.raises(ValueError, match="do not cover"):
-            slice_snapshot_at_sidecar_boundary(snap)
+            slice_snapshot_at_sidecar_boundary(snap, require_full_coverage=True)
+        # Windowed drafts never read the trimmed hole, so the default slice
+        # accepts the gap and clips the spans to the boundary.
+        sliced = slice_snapshot_at_sidecar_boundary(snap)
+        assert sliced.prefix_len == 5
+        assert sliced.target_hidden_chunk_spans == ((0, 2),)
 
     def test_build_snapshot_sidecar_contract(self):
         key = _make_key()
@@ -2010,7 +2015,7 @@ class TestSidecar:
         assert hit is full
         assert cache.stats()["sidecar_hits"] == 0
 
-    def test_l1_lookup_sidecar_skips_uncovered_windowed_snapshot(self):
+    def test_l1_lookup_sidecar_serves_uncovered_windowed_snapshot(self):
         cache = DFlashPrefixCache(max_entries=8)
         key = _make_key()
         snap = _make_sidecar_generation_snapshot([1, 2, 3, 4, 5, 6, 7, 8], 5, key)
@@ -2021,6 +2026,23 @@ class TestSidecar:
         snap.target_hidden_chunk_spans = ((0, 2), (6, 8))
         cache.insert(snap)
         matched, hit = cache.lookup([1, 2, 3, 4, 5, 99], key)
+        assert matched == 5
+        assert hit is not None
+        assert hit.kind == "prefill"
+
+    def test_l1_lookup_sidecar_skips_uncovered_when_full_coverage_required(self):
+        cache = DFlashPrefixCache(max_entries=8)
+        key = _make_key()
+        snap = _make_sidecar_generation_snapshot([1, 2, 3, 4, 5, 6, 7, 8], 5, key)
+        snap.target_hidden_chunks = (
+            mx.zeros((1, 2, 8), dtype=mx.float32),
+            mx.zeros((1, 2, 8), dtype=mx.float32),
+        )
+        snap.target_hidden_chunk_spans = ((0, 2), (6, 8))
+        cache.insert(snap)
+        matched, hit = cache.lookup(
+            [1, 2, 3, 4, 5, 99], key, require_full_coverage=True
+        )
         assert matched == 0
         assert hit is None
 
@@ -2108,3 +2130,86 @@ class TestCoverageFilterL1:
         stats = cache.stats()
         assert stats["sidecar_hits"] == 1
         assert stats["coverage_rejects"] == 0
+
+
+def _make_trimmed_sidecar_carrier(
+    tokens: list[int],
+    boundary: int,
+    key: DFlashPrefixKey,
+    *,
+    sink: int = 4,
+    window: int = 16,
+) -> DFlashPrefixSnapshot:
+    n = len(tokens)
+    kv_cache = _make_kv_cache_populated(n_tokens=n)
+    gdn_cache = _make_gdn_cache_populated()
+    sidecar_gdn = capture_gdn_sidecar([kv_cache, gdn_cache])
+    carrier = build_snapshot(
+        token_ids=tokens,
+        target_cache=[kv_cache, gdn_cache],
+        target_hidden=mx.zeros((1, n, 8), dtype=mx.float32),
+        last_logits=mx.zeros((1, 32), dtype=mx.float32),
+        key=key,
+        kind="generation",
+        draft_sink_size=sink,
+        draft_window_size=window,
+        sidecar_boundary=boundary,
+        sidecar_gdn_states=sidecar_gdn,
+        sidecar_last_logits=mx.full((1, 32), 7.0, dtype=mx.float32),
+    )
+    assert not snapshot_covers_prefix(carrier, boundary)
+    return carrier
+
+
+class TestTrimmedSidecar:
+    def test_trim_keeps_window_before_sidecar_boundary(self):
+        key = _make_key()
+        tokens = list(range(1000, 1064))
+        carrier = _make_trimmed_sidecar_carrier(tokens, 48, key, sink=4, window=16)
+        # Tail must start at boundary - window (32), not total - window (48),
+        # so a sliced restore at the boundary sees real features.
+        assert carrier.target_hidden_chunk_spans == ((0, 4), (32, 64))
+
+    def test_l1_sidecar_hit_serves_trimmed_carrier(self):
+        cache = DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024)
+        key = _make_key()
+        tokens = list(range(1000, 1064))
+        boundary = 48
+        carrier = _make_trimmed_sidecar_carrier(tokens, boundary, key)
+        cache.insert(carrier)
+
+        matched, served = cache.lookup(tokens[:boundary], key)
+        assert matched == boundary
+        assert served is not None
+        assert served.kind == "prefill"
+        assert served.prefix_len == boundary
+        assert served.last_logits is not None
+        stats = cache.stats()
+        assert stats["sidecar_hits"] == 1
+
+    def test_l1_trimmed_sidecar_rejected_when_full_coverage_required(self):
+        cache = DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024)
+        key = _make_key()
+        tokens = list(range(1000, 1064))
+        boundary = 48
+        carrier = _make_trimmed_sidecar_carrier(tokens, boundary, key)
+        cache.insert(carrier)
+
+        matched, served = cache.lookup(
+            tokens[:boundary], key, require_full_coverage=True
+        )
+        assert matched == 0
+        assert served is None
+
+    def test_slice_at_sidecar_boundary_clips_trimmed_spans(self):
+        key = _make_key()
+        tokens = list(range(1000, 1064))
+        boundary = 48
+        carrier = _make_trimmed_sidecar_carrier(tokens, boundary, key)
+
+        sliced = slice_snapshot_at_sidecar_boundary(carrier)
+        assert sliced.prefix_len == boundary
+        assert sliced.target_hidden_chunk_spans == ((0, 4), (32, 48))
+
+        with pytest.raises(ValueError):
+            slice_snapshot_at_sidecar_boundary(carrier, require_full_coverage=True)
