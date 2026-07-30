@@ -306,7 +306,12 @@ class Gemma4TargetOps:
 
     def supports_model(self, target_model: Any) -> bool:
         model_type = self.model_type(target_model)
-        if model_type not in ("gemma4", "gemma4_text"):
+        if model_type not in (
+            "gemma4",
+            "gemma4_text",
+            "gemma4_unified",
+            "gemma4_unified_text",
+        ):
             return False
         try:
             inner = self.text_model(target_model)

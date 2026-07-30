@@ -322,6 +322,20 @@ def test_real_zlab_gemma4_draft_shape_allocates_full_context_from_target_capabil
     ]
 
 
+@pytest.mark.parametrize("model_type", ["gemma4_unified", "gemma4_unified_text"])
+def test_gemma4_unified_target_supports_model(model_type):
+    target_model = SimpleNamespace(
+        args=SimpleNamespace(
+            model_type=model_type,
+            layer_types=("sliding_attention", "full_attention"),
+            num_kv_shared_layers=0,
+        ),
+        model=SimpleNamespace(layers=[object()], embed_tokens=object()),
+    )
+
+    assert Gemma4TargetOps().supports_model(target_model)
+
+
 def test_full_context_draft_cache_keeps_all_positions_without_windowing():
     sliding_cache = ContextOnlyDraftKVCache(sink_size=2, window_size=3)
     full_cache = FullContextDraftKVCache()
