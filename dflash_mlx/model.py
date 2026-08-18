@@ -988,6 +988,12 @@ class DFlash2DraftModel(DFlashDraftModel):
         self.is_dflash2 = True
         self.candidate_selector = CandidateSelector(args)
 
+    def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
+        for name in ("predecessor_codebook", "successor_codebook"):
+            key = f"candidate_selector.{name}"
+            weights[f"{key}.weight"] = weights.pop(key)
+        return weights
+
     def select_candidates(
         self,
         hidden: mx.array,

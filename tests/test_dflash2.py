@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
+from mlx.utils import tree_flatten
 
 from dflash_mlx.engine.acceptance import rejection_sample
 from dflash_mlx.engine.sampling import sampling_probs
@@ -14,7 +16,7 @@ from dflash_mlx.model import (
     DFlashDraftModelArgs,
     _grouped_dynamic_convolve,
 )
-from dflash_mlx.runtime.loading import _get_dflash_model_classes
+from dflash_mlx.runtime.loading import _get_dflash_model_classes, load_draft_bundle
 
 
 def _args(**overrides):
@@ -111,6 +113,23 @@ def test_dflash2_loader_dispatches_by_architecture():
     )
     assert model_cls is DFlash2DraftModel
     assert args_cls is DFlashDraftModelArgs
+
+
+def test_dflash2_loader_accepts_bare_codebook_keys(tmp_path):
+    args = _args()
+    weights = dict(tree_flatten(DFlash2DraftModel(args).parameters()))
+    for name in ("predecessor_codebook", "successor_codebook"):
+        key = f"candidate_selector.{name}"
+        weights[key] = weights.pop(f"{key}.weight")
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    (tmp_path / "config.json").write_text(
+        json.dumps({**args.__dict__, "architectures": ["DFlash2DraftModel"]})
+    )
+
+    model, _ = load_draft_bundle(tmp_path, lazy=False)
+
+    assert model.candidate_selector.predecessor_codebook.weight.shape == (4, 1)
+    assert model.candidate_selector.successor_codebook.weight.shape == (4, 1)
 
 
 def test_noncausal_sliding_mask_sees_whole_block_and_windowed_context():
