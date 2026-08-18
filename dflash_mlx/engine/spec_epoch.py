@@ -27,7 +27,7 @@ from dflash_mlx.cache.snapshot import (
     validate_prefix_snapshot as _validate_prefix_snapshot,
 )
 from dflash_mlx.draft_backend import DraftBackend
-from dflash_mlx.engine.acceptance import match_acceptance_length_host
+from dflash_mlx.engine.acceptance import match_acceptance_length_host, rejection_sample
 from dflash_mlx.engine.copyspec import CopySpecAutoGate, CopySpecIndex
 from dflash_mlx.engine.ddtree import (
     build_flat_ddtree,
@@ -59,6 +59,9 @@ from dflash_mlx.engine.sampling import (
     masked_topk_arrays,
     ns_to_us,
     prepare_prompt_tokens,
+    sample_logits,
+    sample_probs,
+    sampling_probs,
 )
 from dflash_mlx.engine.target_features import TargetFeatureStore
 from dflash_mlx.engine.config import (
@@ -126,6 +129,9 @@ class _SessionRequest:
     block_tokens: Optional[int] = None
     stop_token_ids: tuple[int, ...] = ()
     suppress_token_ids: Optional[list[int]] = None
+    temperature: float = 0.0
+    top_p: float = 1.0
+    top_k: int = 0
     prefix_snapshot: Optional[DFlashPrefixSnapshot] = None
     snapshot_service: Optional[SnapshotService] = None
     stable_prefix_len: Optional[int] = None
@@ -157,6 +163,9 @@ class _SessionRequest:
         publish_generation_snapshot: bool = True,
         prefix_hit_kind: str = "miss",
         prompt_token_positions: Optional[list[int]] = None,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: int = 0,
     ) -> "_SessionRequest":
         return cls(
             prompt_tokens=tuple(int(token) for token in prompt_tokens),
@@ -168,6 +177,9 @@ class _SessionRequest:
                 if suppress_token_ids is not None
                 else None
             ),
+            temperature=float(temperature),
+            top_p=float(top_p),
+            top_k=int(top_k),
             prefix_snapshot=prefix_snapshot,
             snapshot_service=snapshot_service,
             stable_prefix_len=stable_prefix_len,
@@ -1091,8 +1103,11 @@ class SpeculativeSession:
             int(state.prefill_logits.shape[-1]),
             suppress_token_ids,
         )
-        state.staged_first = greedy_tokens_with_mask(
+        state.staged_first = sample_logits(
             state.prefill_logits[:, -1, :],
+            request.temperature,
+            request.top_p,
+            request.top_k,
             suppress_token_mask,
         ).reshape(-1)
         prefill_tokens_restored = max(0, min(int(snap_prefix_len), int(prompt_len)))
@@ -1913,7 +1928,11 @@ class SpeculativeSession:
         prefill: _PrefillResult,
         yield_pause: "_YieldPauseTracker",
     ) -> Generator[EngineEvent, None, _DecodeResult]:
-        if str(getattr(self.runtime_config, "verify_mode", "dflash")) == "ddtree":
+        if (
+            str(getattr(self.runtime_config, "verify_mode", "dflash")) == "ddtree"
+            and not getattr(self.draft_model, "is_dflash2", False)
+            and request.temperature <= 0
+        ):
             return (
                 yield from self._run_ddtree_decode_events(
                     request=request,
@@ -2018,7 +2037,11 @@ class SpeculativeSession:
             block_len: int,
             draft_context: mx.array,
         ) -> mx.array | None:
-            if self.copyspec_mode == "off" or state.copyspec_disabled:
+            if (
+                request.temperature > 0
+                or self.copyspec_mode == "off"
+                or state.copyspec_disabled
+            ):
                 return None
             candidate = self.copyspec_index.draft_after(
                 staged_first_token,
@@ -2035,6 +2058,34 @@ class SpeculativeSession:
                 draft_context=draft_context,
             )
             return mx.array(candidate, dtype=mx.uint32)
+
+        def _draft_for_block(
+            staged_first: mx.array,
+            block_len: int,
+            draft_context: mx.array,
+            *,
+            async_launch: bool,
+        ) -> tuple[mx.array, mx.array | None, mx.array | None]:
+            common = dict(
+                target_model=target_model,
+                target_ops=target_ops,
+                draft_model=draft_model,
+                draft_cache=draft_cache,
+                staged_first=staged_first,
+                draft_context=draft_context,
+                block_len=block_len,
+                mask_token_tail=mask_token_tail,
+                suppress_token_mask=suppress_token_mask,
+                async_launch=async_launch,
+            )
+            if request.temperature > 0:
+                return draft_backend.draft_sample(
+                    **common,
+                    temperature=request.temperature,
+                    top_p=request.top_p,
+                    top_k=request.top_k,
+                )
+            return draft_backend.draft_greedy(**common), None, None
 
         draft_ns_total = 0
         draft_prefill_ns = 0
@@ -2102,6 +2153,8 @@ class SpeculativeSession:
             copyspec_tokens = 0
             draft_topk_ids_arr = None
             draft_topk_logprobs_arr = None
+            draft_probs_arr = None
+            draft_indices_arr = None
             posterior_top2_ids_arr = None
             posterior_top2_logprobs_arr = None
 
@@ -2116,7 +2169,7 @@ class SpeculativeSession:
                     if drafted is not None:
                         draft_source = "copyspec"
                         copyspec_tokens = int(drafted.shape[0])
-                    elif capture_logits:
+                    elif capture_logits and request.temperature <= 0:
                         drafted, draft_topk_ids_arr, draft_topk_logprobs_arr = (
                             draft_backend.draft_greedy_capture(
                                 target_model=target_model,
@@ -2134,16 +2187,10 @@ class SpeculativeSession:
                         )
                         draft_source = "dflash"
                     else:
-                        drafted = draft_backend.draft_greedy(
-                            target_model=target_model,
-                            target_ops=target_ops,
-                            draft_model=draft_model,
-                            draft_cache=draft_cache,
-                            staged_first=current_staged_first,
-                            draft_context=feature_store.require_current_hidden(),
-                            block_len=block_len,
-                            mask_token_tail=mask_token_tail,
-                            suppress_token_mask=suppress_token_mask,
+                        drafted, draft_probs_arr, draft_indices_arr = _draft_for_block(
+                            current_staged_first,
+                            block_len,
+                            feature_store.require_current_hidden(),
                             async_launch=False,
                         )
                         draft_source = "dflash"
@@ -2161,6 +2208,8 @@ class SpeculativeSession:
                             state.prefetched_draft["staged_first_id"]
                         )
                         draft_source = str(state.prefetched_draft["source"])
+                        draft_probs_arr = state.prefetched_draft.get("draft_probs")
+                        draft_indices_arr = state.prefetched_draft.get("draft_indices")
                     else:
                         draft_start_ns = time.perf_counter_ns()
                         drafted = _copy_draft_for_block(
@@ -2172,17 +2221,13 @@ class SpeculativeSession:
                             draft_source = "copyspec"
                             copyspec_tokens = int(drafted.shape[0])
                         else:
-                            drafted = draft_backend.draft_greedy(
-                                target_model=target_model,
-                                target_ops=target_ops,
-                                draft_model=draft_model,
-                                draft_cache=draft_cache,
-                                staged_first=current_staged_first,
-                                draft_context=feature_store.require_current_hidden(),
-                                block_len=block_len,
-                                mask_token_tail=mask_token_tail,
-                                suppress_token_mask=suppress_token_mask,
-                                async_launch=True,
+                            drafted, draft_probs_arr, draft_indices_arr = (
+                                _draft_for_block(
+                                    current_staged_first,
+                                    block_len,
+                                    feature_store.require_current_hidden(),
+                                    async_launch=True,
+                                )
                             )
                             draft_source = "dflash"
                         draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
@@ -2250,7 +2295,11 @@ class SpeculativeSession:
                     yield_pause.done(_pre_yield)
 
             acceptance_start_ns = time.perf_counter_ns() if profile_cycles else 0
-            posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
+            posterior = None
+            if request.temperature <= 0:
+                posterior = greedy_tokens_with_mask(
+                    verify_logits[0], suppress_token_mask
+                )
             if capture_logits:
                 posterior_top2_ids_arr, posterior_top2_logprobs_arr = (
                     masked_topk_arrays(
@@ -2259,16 +2308,47 @@ class SpeculativeSession:
                         width=2,
                     )
                 )
-            # Single device-to-host transfer per cycle (same pattern as the
-            # ddtree path): acceptance matching, commit ids, the next staged
-            # token and the stop check all run on these host ints.
             verify_id_count = int(verify_token_ids.shape[0])
-            transferred = mx.concatenate([verify_token_ids, posterior]).tolist()
-            verify_ids_host = [int(t) for t in transferred[:verify_id_count]]
-            posterior_host = [int(t) for t in transferred[verify_id_count:]]
-            acceptance_len = match_acceptance_length_host(
-                verify_ids_host[1:], posterior_host[:-1]
-            )
+            if request.temperature > 0:
+                verify_ids_host = [int(t) for t in verify_token_ids.tolist()]
+                posterior_host = []
+                target_probs = sampling_probs(
+                    verify_logits,
+                    request.temperature,
+                    request.top_p,
+                    request.top_k,
+                    suppress_token_mask,
+                )
+                if verify_id_count > 1:
+                    assert draft_probs_arr is not None
+                    draft_count = verify_id_count - 1
+                    acceptance_len, staged_first_next_id = rejection_sample(
+                        verify_token_ids[None, 1:],
+                        target_probs,
+                        draft_probs_arr[:, :draft_count],
+                        (
+                            draft_indices_arr[:, :draft_count]
+                            if draft_indices_arr is not None
+                            else None
+                        ),
+                    )
+                else:
+                    acceptance_len = 0
+                    staged_first_next_id = int(
+                        sample_probs(target_probs[:, 0])[0].item()
+                    )
+            else:
+                # One device-to-host transfer covers greedy acceptance,
+                # committed ids, the next staged token and the stop check.
+                transferred = mx.concatenate(
+                    [verify_token_ids, posterior]
+                ).tolist()
+                verify_ids_host = [int(t) for t in transferred[:verify_id_count]]
+                posterior_host = [int(t) for t in transferred[verify_id_count:]]
+                acceptance_len = match_acceptance_length_host(
+                    verify_ids_host[1:], posterior_host[:-1]
+                )
+                staged_first_next_id = posterior_host[acceptance_len]
             state.acceptance_history.append(acceptance_len)
             if profile_cycles:
                 acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
@@ -2279,14 +2359,18 @@ class SpeculativeSession:
             )[:, : (1 + acceptance_len), :]
             if profile_cycles:
                 if posterior_top2_ids_arr is not None:
-                    mx.eval(
+                    values = [
                         committed_hidden,
-                        posterior,
                         posterior_top2_ids_arr,
                         posterior_top2_logprobs_arr,
-                    )
-                else:
+                    ]
+                    if posterior is not None:
+                        values.append(posterior)
+                    mx.eval(*values)
+                elif posterior is not None:
                     mx.eval(committed_hidden, posterior)
+                else:
+                    mx.eval(committed_hidden)
             else:
                 mx.async_eval(committed_hidden)
             if profile_cycles:
@@ -2337,8 +2421,7 @@ class SpeculativeSession:
                 state.copyspec_tokens += copyspec_tokens or max(0, int(block_len) - 1)
                 if self.copyspec_mode == "conservative" and acceptance_len == 0:
                     state.copyspec_disabled = True
-            staged_first_next = posterior[acceptance_len : acceptance_len + 1]
-            staged_first_next_id = posterior_host[acceptance_len]
+            staged_first_next = mx.array([staged_first_next_id], dtype=mx.uint32)
             if adaptive_block_policy is not None or copyspec_auto_gate is not None:
                 cycle_wall_ns = time.perf_counter_ns() - cycle_start_ns
                 cycle_pause_ns = max(0, yield_pause.pause_ns - cycle_pause_start_ns)
@@ -2398,18 +2481,15 @@ class SpeculativeSession:
                     )
                     if next_drafted is None:
                         next_source = "dflash"
-                        next_drafted = draft_backend.draft_greedy(
-                            target_model=target_model,
-                            target_ops=target_ops,
-                            draft_model=draft_model,
-                            draft_cache=draft_cache,
-                            staged_first=staged_first_next,
-                            draft_context=feature_store.require_current_hidden(),
-                            block_len=next_block_len,
-                            mask_token_tail=mask_token_tail,
-                            suppress_token_mask=suppress_token_mask,
+                        next_drafted, next_probs, next_indices = _draft_for_block(
+                            staged_first_next,
+                            next_block_len,
+                            feature_store.require_current_hidden(),
                             async_launch=True,
                         )
+                    else:
+                        next_probs = None
+                        next_indices = None
                     launch_ns = time.perf_counter_ns() - draft_start_ns
                     draft_ns_total += launch_ns
                     draft_incremental_ns += launch_ns
@@ -2419,6 +2499,8 @@ class SpeculativeSession:
                         "staged_first_id": staged_first_next_id,
                         "drafted": next_drafted,
                         "source": next_source,
+                        "draft_probs": next_probs,
+                        "draft_indices": next_indices,
                     }
                 else:
                     state.prefetched_draft = None
@@ -2827,6 +2909,9 @@ def stream_dflash_generate_impl(
     block_tokens: Optional[int] = None,
     stop_token_ids: Optional[list[int]] = None,
     suppress_token_ids: Optional[list[int]] = None,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
     prompt_tokens_override: Optional[list[int]] = None,
     prompt_token_positions: Optional[list[int]] = None,
     quantize_kv_cache: bool = False,
@@ -2879,6 +2964,9 @@ def stream_dflash_generate_impl(
             use_chat_template=use_chat_template,
             stop_token_ids=stop_token_ids,
             suppress_token_ids=suppress_token_ids,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
             prompt_tokens_override=prompt_tokens,
             quantize_kv_cache=quantize_kv_cache,
             fallback_reason=fallback_reason,
@@ -2890,6 +2978,9 @@ def stream_dflash_generate_impl(
         block_tokens=block_tokens,
         stop_token_ids=stop_token_ids,
         suppress_token_ids=suppress_token_ids,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
         prefix_snapshot=prefix_snapshot,
         snapshot_service=snapshot_service,
         stable_prefix_len=stable_prefix_len,

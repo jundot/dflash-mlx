@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import mlx.core as mx
 
+from dflash_mlx.engine.sampling import sample_probs
+
 def match_acceptance_length(
     drafted_tokens: mx.array,
     posterior_tokens: mx.array,
@@ -26,3 +28,51 @@ def match_acceptance_length_host(
             break
         accepted += 1
     return accepted
+
+
+def rejection_sample(
+    draft_tokens: mx.array,
+    target_probs: mx.array,
+    draft_probs: mx.array,
+    draft_indices: mx.array | None = None,
+) -> tuple[int, int]:
+    gamma = int(draft_tokens.shape[1])
+    p = mx.take_along_axis(
+        target_probs[:, :gamma], draft_tokens[..., None], axis=-1
+    )[..., 0]
+    if draft_indices is None:
+        q = mx.take_along_axis(draft_probs, draft_tokens[..., None], axis=-1)[..., 0]
+    else:
+        q = mx.sum(
+            draft_probs * (draft_indices == draft_tokens[..., None]),
+            axis=-1,
+        )
+    accepted = int(
+        mx.sum(
+            mx.cumprod(
+                (mx.random.uniform(shape=q.shape) * q < p).astype(mx.int32),
+                axis=-1,
+            ),
+            axis=-1,
+        )[0].item()
+    )
+    if accepted == gamma:
+        return accepted, int(sample_probs(target_probs[:, -1])[0].item())
+
+    residual = target_probs[0, accepted]
+    if draft_indices is None:
+        residual = residual - draft_probs[0, accepted]
+    else:
+        indices = draft_indices[0, accepted]
+        values = mx.take(residual, indices) - draft_probs[0, accepted]
+        residual = mx.put_along_axis(
+            residual[None], indices[None], values[None], axis=-1
+        )[0]
+    residual = mx.maximum(residual, 0)
+    total = mx.sum(residual)
+    residual = mx.where(
+        total > 0,
+        residual / mx.maximum(total, 1e-30),
+        target_probs[0, accepted],
+    )
+    return accepted, int(sample_probs(residual[None])[0].item())

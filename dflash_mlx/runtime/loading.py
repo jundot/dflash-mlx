@@ -20,6 +20,7 @@ from dflash_mlx.internal_debug import (
     verify_qmm_enabled as _debug_verify_qmm_enabled,
 )
 from dflash_mlx.model import (
+    DFlash2DraftModel,
     DFlashDraftModel,
     DFlashDraftModelArgs,
 )
@@ -69,6 +70,8 @@ def _get_dflash_model_classes(config: dict[str, Any]):
 
     if is_muse_glimmer_draft_config(config):
         return MuseGlimmerDraftModel, MuseGlimmerDraftModelArgs
+    if "DFlash2DraftModel" in (config.get("architectures") or ()):
+        return DFlash2DraftModel, DFlashDraftModelArgs
     return DFlashDraftModel, DFlashDraftModelArgs
 
 

@@ -8,12 +8,30 @@ from typing import Any, Optional, Protocol
 
 import mlx.core as mx
 
-from dflash_mlx.engine.sampling import greedy_tokens_with_mask, masked_topk_arrays
+from dflash_mlx.engine.sampling import (
+    greedy_tokens_with_mask,
+    masked_topk_arrays,
+    sample_probs,
+    sampling_probs,
+)
 from dflash_mlx.model import (
     ContextOnlyDraftKVCache,
     DFlashDraftModel,
     FullContextDraftKVCache,
 )
+
+
+def _mask_logits(
+    logits: mx.array,
+    suppress_token_mask: Optional[mx.array],
+) -> mx.array:
+    if suppress_token_mask is None:
+        return logits
+    return mx.where(
+        suppress_token_mask,
+        mx.array(-1e9, dtype=logits.dtype),
+        logits,
+    )
 
 
 class DraftBackend(Protocol):
@@ -41,6 +59,25 @@ class DraftBackend(Protocol):
         suppress_token_mask: Optional[mx.array],
         async_launch: bool,
     ) -> mx.array:
+        ...
+
+    def draft_sample(
+        self,
+        *,
+        target_model: Any,
+        target_ops: Any,
+        draft_model: DFlashDraftModel,
+        draft_cache: list[Any],
+        staged_first: mx.array,
+        draft_context: mx.array,
+        block_len: int,
+        mask_token_tail: mx.array,
+        suppress_token_mask: Optional[mx.array],
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        async_launch: bool,
+    ) -> tuple[mx.array, mx.array, Optional[mx.array]]:
         ...
 
     def draft_with_topk(
@@ -123,7 +160,7 @@ class EagerDraftBackend:
                 )
         return caches
 
-    def _draft_block_logits(
+    def _draft_block_hidden_logits(
         self,
         *,
         target_model: Any,
@@ -134,7 +171,7 @@ class EagerDraftBackend:
         draft_context: mx.array,
         block_len: int,
         mask_token_tail: mx.array,
-    ) -> mx.array:
+    ) -> tuple[mx.array, mx.array]:
         if int(block_len) <= 1:
             raise ValueError("draft_greedy requires block_len > 1")
 
@@ -153,11 +190,12 @@ class EagerDraftBackend:
             noise_embedding=noise_embedding,
             draft_context=draft_context,
             cache=draft_cache,
-        )
-        return target_ops.logits_from_hidden(
+        )[:, 1:, :]
+        draft_logits = target_ops.logits_from_hidden(
             target_model,
-            draft_hidden[:, 1:, :],
+            draft_hidden,
         )
+        return draft_hidden, draft_logits
 
     def draft_greedy(
         self,
@@ -173,7 +211,7 @@ class EagerDraftBackend:
         suppress_token_mask: Optional[mx.array],
         async_launch: bool,
     ) -> mx.array:
-        draft_logits = self._draft_block_logits(
+        draft_hidden, draft_logits = self._draft_block_hidden_logits(
             target_model=target_model,
             target_ops=target_ops,
             draft_model=draft_model,
@@ -183,15 +221,73 @@ class EagerDraftBackend:
             block_len=block_len,
             mask_token_tail=mask_token_tail,
         )
-        drafted = greedy_tokens_with_mask(
-            draft_logits,
-            suppress_token_mask,
-        ).squeeze(0)
+        draft_logits = _mask_logits(draft_logits, suppress_token_mask)
+        if getattr(draft_model, "is_dflash2", False):
+            drafted, _, _ = draft_model.select_candidates(
+                draft_hidden,
+                draft_logits,
+                staged_first[:1],
+            )
+            drafted = drafted.squeeze(0)
+        else:
+            drafted = greedy_tokens_with_mask(draft_logits).squeeze(0)
         if async_launch:
             mx.async_eval(drafted)
         else:
-            mx.eval(draft_logits)
+            mx.eval(drafted)
         return drafted
+
+    def draft_sample(
+        self,
+        *,
+        target_model: Any,
+        target_ops: Any,
+        draft_model: DFlashDraftModel,
+        draft_cache: list[Any],
+        staged_first: mx.array,
+        draft_context: mx.array,
+        block_len: int,
+        mask_token_tail: mx.array,
+        suppress_token_mask: Optional[mx.array],
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        async_launch: bool,
+    ) -> tuple[mx.array, mx.array, Optional[mx.array]]:
+        draft_hidden, draft_logits = self._draft_block_hidden_logits(
+            target_model=target_model,
+            target_ops=target_ops,
+            draft_model=draft_model,
+            draft_cache=draft_cache,
+            staged_first=staged_first,
+            draft_context=draft_context,
+            block_len=block_len,
+            mask_token_tail=mask_token_tail,
+        )
+        draft_logits = _mask_logits(draft_logits, suppress_token_mask)
+        if getattr(draft_model, "is_dflash2", False):
+            drafted, indices, probs = draft_model.select_candidates(
+                draft_hidden,
+                draft_logits,
+                staged_first[:1],
+                temperature,
+            )
+            assert probs is not None
+        else:
+            probs = sampling_probs(
+                draft_logits,
+                temperature,
+                top_p,
+                top_k,
+            )
+            drafted = sample_probs(probs)
+            indices = None
+        drafted = drafted.squeeze(0)
+        if async_launch:
+            mx.async_eval(drafted, probs)
+        else:
+            mx.eval(drafted, probs)
+        return drafted, probs, indices
 
     def draft_greedy_capture(
         self,
@@ -208,7 +304,7 @@ class EagerDraftBackend:
         async_launch: bool,
         top_width: int,
     ) -> tuple[mx.array, mx.array, mx.array]:
-        draft_logits = self._draft_block_logits(
+        draft_hidden, draft_logits = self._draft_block_hidden_logits(
             target_model=target_model,
             target_ops=target_ops,
             draft_model=draft_model,
@@ -218,19 +314,25 @@ class EagerDraftBackend:
             block_len=block_len,
             mask_token_tail=mask_token_tail,
         )
-        drafted = greedy_tokens_with_mask(
-            draft_logits,
-            suppress_token_mask,
-        ).squeeze(0)
+        draft_logits = _mask_logits(draft_logits, suppress_token_mask)
+        if getattr(draft_model, "is_dflash2", False):
+            drafted, _, _ = draft_model.select_candidates(
+                draft_hidden,
+                draft_logits,
+                staged_first[:1],
+            )
+            drafted = drafted.squeeze(0)
+        else:
+            drafted = greedy_tokens_with_mask(draft_logits).squeeze(0)
         top_ids, top_logprobs = masked_topk_arrays(
             draft_logits.squeeze(0),
-            suppress_token_mask,
+            None,
             width=top_width,
         )
         if async_launch:
             mx.async_eval(drafted, top_ids, top_logprobs)
         else:
-            mx.eval(draft_logits, top_ids, top_logprobs)
+            mx.eval(drafted, top_ids, top_logprobs)
         return drafted, top_ids, top_logprobs
 
     def draft_with_topk(

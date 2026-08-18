@@ -260,10 +260,37 @@ class DFlashDraftModelArgs:
     sliding_window: Optional[int] = None
     sliding_window_pattern: Optional[int] = None
     dflash_config: dict[str, Any] | None = None
+    architectures: tuple[str, ...] = ()
+    is_causal: Optional[bool] = None
 
     @classmethod
     def from_dict(cls, params: dict[str, Any]) -> "DFlashDraftModelArgs":
         data = dict(params)
+        dflash_config = dict(data.get("dflash_config") or {})
+        if (
+            data.get("block_size") is None
+            and dflash_config.get("block_size") is not None
+        ):
+            data["block_size"] = int(dflash_config["block_size"])
+        rope_parameters = data.get("rope_parameters")
+        if (
+            data.get("rope_theta") is None
+            and isinstance(rope_parameters, dict)
+            and rope_parameters.get("rope_theta") is not None
+        ):
+            data["rope_theta"] = float(rope_parameters["rope_theta"])
+        if data.get("rope_scaling") is None and isinstance(rope_parameters, dict):
+            rope_type = (
+                rope_parameters.get("type")
+                or rope_parameters.get("rope_type")
+                or "default"
+            )
+            if rope_type != "default":
+                data["rope_scaling"] = {
+                    key: value
+                    for key, value in rope_parameters.items()
+                    if key != "rope_theta"
+                }
         layer_types = tuple(data.get("layer_types") or ())
         model_type = str(data.get("model_type", ""))
         if (
@@ -282,7 +309,8 @@ class DFlashDraftModelArgs:
             ):
                 data["sliding_window"] = _GEMMA4_DEFAULT_SLIDING_WINDOW
         data["layer_types"] = layer_types
-        data["dflash_config"] = dict(data.get("dflash_config") or {})
+        data["dflash_config"] = dflash_config
+        data["architectures"] = tuple(data.get("architectures") or ())
         return cls(
             **{key: value for key, value in data.items() if key in cls.__annotations__}
         )
@@ -326,6 +354,11 @@ class DFlashAttention(nn.Module):
             if layer_type == "sliding_attention" and args.sliding_window
             else None
         )
+        self.is_causal = (
+            self.sliding_window is not None
+            if args.is_causal is None
+            else bool(args.is_causal)
+        )
         self.q_proj = nn.Linear(dim, self.n_heads * self.head_dim, bias=args.attention_bias)
         self.k_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=args.attention_bias)
         self.v_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=args.attention_bias)
@@ -348,10 +381,15 @@ class DFlashAttention(nn.Module):
         key_len: int,
         key_positions: Optional[mx.array] = None,
     ) -> Optional[mx.array]:
-        if self.sliding_window is None:
+        if self.sliding_window is None and not self.is_causal:
             return None
         full_key_len = query_offset + block_len
-        if key_positions is None and int(key_len) == full_key_len:
+        if (
+            self.sliding_window is not None
+            and self.is_causal
+            and key_positions is None
+            and int(key_len) == full_key_len
+        ):
             return create_causal_mask(
                 block_len,
                 offset=query_offset,
@@ -366,9 +404,15 @@ class DFlashAttention(nn.Module):
         if key_positions is None:
             key_start = full_key_len - int(key_len)
             key_positions = mx.arange(key_start, full_key_len, dtype=mx.int32)
-        return (query_positions[:, None] >= key_positions[None, :]) & (
-            query_positions[:, None] < key_positions[None, :] + self.sliding_window
-        )
+        query = query_positions[:, None]
+        key = key_positions[None, :]
+        context = key < query_offset
+        if self.sliding_window is not None:
+            context = context & (query - key < self.sliding_window)
+        block = key >= query_offset
+        if self.is_causal:
+            block = block & (key <= query)
+        return context | block
 
     def _context_segments_for_cache(
         self,
@@ -531,7 +575,7 @@ class DFlashAttention(nn.Module):
                 )
                 keys, values = cache.fetch_with_block(noise_keys, noise_values)
                 mask = None
-                if self.sliding_window is not None:
+                if self.sliding_window is not None or self.is_causal:
                     noise_positions = mx.arange(
                         query_offset,
                         query_offset + block_len,
@@ -627,7 +671,11 @@ class DFlashAttention(nn.Module):
             queries = self.rope(queries, offset=ctx_len)
             context_keys = self.rope(context_keys, offset=0)
             noise_keys = self.rope(noise_keys, offset=ctx_len)
-            if self.sliding_window is None and hasattr(mx.fast, "dflash_cross_attention"):
+            if (
+                self.sliding_window is None
+                and not self.is_causal
+                and hasattr(mx.fast, "dflash_cross_attention")
+            ):
                 output = mx.fast.dflash_cross_attention(
                     queries,
                     context_keys,
@@ -696,13 +744,166 @@ class DFlashDecoderLayer(nn.Module):
             cache=cache,
         )
 
+
+def _grouped_dynamic_convolve(
+    hidden: mx.array,
+    dynamic: mx.array,
+    base: mx.array,
+    group_size: int,
+) -> mx.array:
+    batch, length, hidden_size = hidden.shape
+    groups = hidden_size // group_size
+    blocks = hidden.reshape(batch, length, groups, group_size)
+    dynamic = dynamic.reshape(batch, length, base.shape[0], groups, 1)
+    output = mx.zeros_like(blocks)
+    for offset in range(int(base.shape[0])):
+        values = (
+            blocks
+            if offset == 0
+            else mx.concatenate(
+                [mx.zeros_like(blocks[:, :offset]), blocks[:, :-offset]], axis=1
+            )
+        )
+        kernel = base[offset].reshape(1, 1, groups, group_size).astype(hidden.dtype)
+        output = output + (kernel + dynamic[:, :, offset]) * values
+    return output.reshape(hidden.shape)
+
+
+class GroupedDynamicCausalConv(nn.Module):
+    def __init__(self, hidden_size: int, kernel_size: int, group_size: int):
+        super().__init__()
+        groups = hidden_size // group_size
+        self.group_size = group_size
+        self.base_kernel = mx.zeros((2, kernel_size, hidden_size))
+        self.kernel_projection = nn.Linear(
+            hidden_size,
+            2 * kernel_size * groups,
+            bias=False,
+        )
+
+    def prepare(self, hidden: mx.array) -> tuple[mx.array, mx.array]:
+        groups = hidden.shape[-1] // self.group_size
+        dynamic = self.kernel_projection(hidden).reshape(
+            *hidden.shape[:-1], 2, self.base_kernel.shape[1], groups
+        )
+        return (
+            _grouped_dynamic_convolve(
+                hidden,
+                dynamic[..., 0, :, :],
+                self.base_kernel[0],
+                self.group_size,
+            ),
+            dynamic[..., 1, :, :],
+        )
+
+    def finish(self, hidden: mx.array, dynamic: mx.array) -> mx.array:
+        return _grouped_dynamic_convolve(
+            hidden,
+            dynamic,
+            self.base_kernel[1],
+            self.group_size,
+        )
+
+
+class DFlash2DecoderLayer(DFlashDecoderLayer):
+    def __init__(self, args: DFlashDraftModelArgs, layer_idx: int):
+        super().__init__(args, layer_idx)
+        config = args.dflash_config or {}
+        kernel_size = int(config["conv_kernel_size"])
+        group_size = int(config["conv_group_size"])
+        self.attention_conv = GroupedDynamicCausalConv(
+            args.hidden_size, kernel_size, group_size
+        )
+        self.mlp_conv = GroupedDynamicCausalConv(
+            args.hidden_size, kernel_size, group_size
+        )
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        *,
+        target_hidden: mx.array,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        residual = hidden_states
+        hidden_states, kernel = self.attention_conv.prepare(
+            self.input_layernorm(hidden_states)
+        )
+        hidden_states = residual + self.attention_conv.finish(
+            self.self_attn(
+                hidden_states,
+                target_hidden=target_hidden,
+                cache=cache,
+            ),
+            kernel,
+        )
+
+        residual = hidden_states
+        hidden_states, kernel = self.mlp_conv.prepare(
+            self.post_attention_layernorm(hidden_states)
+        )
+        return residual + self.mlp_conv.finish(self.mlp(hidden_states), kernel)
+
+
+class CandidateSelector(nn.Module):
+    def __init__(self, args: DFlashDraftModelArgs):
+        super().__init__()
+        config = args.dflash_config or {}
+        self.top_k = int(config["selector_top_k"])
+        rank = int(config["selector_rank"])
+        self.predecessor_codebook = nn.Embedding(args.vocab_size, rank)
+        self.successor_codebook = nn.Embedding(args.vocab_size, rank)
+        self.hidden_projection = nn.Linear(args.hidden_size, rank, bias=False)
+
+    def select(
+        self,
+        hidden: mx.array,
+        logits: mx.array,
+        anchor_ids: mx.array,
+        temperature: float = 0.0,
+    ) -> tuple[mx.array, mx.array, Optional[mx.array]]:
+        candidates = mx.argpartition(logits, -self.top_k, axis=-1)[..., -self.top_k :]
+        unary = mx.take_along_axis(logits, candidates, axis=-1)
+        hidden = self.hidden_projection(hidden)
+        predecessor = anchor_ids
+        path = []
+        probabilities = []
+        for position in range(int(hidden.shape[1])):
+            edges = mx.sum(
+                self.predecessor_codebook(predecessor)[:, None]
+                * hidden[:, position, None]
+                * self.successor_codebook(candidates[:, position]),
+                axis=-1,
+            )
+            scores = unary[:, position] + edges
+            if temperature > 0:
+                probs = mx.softmax(
+                    scores.astype(mx.float32) / float(temperature), axis=-1
+                )
+                selected = mx.random.categorical(mx.log(probs))
+                probabilities.append(probs)
+            else:
+                selected = mx.argmax(scores, axis=-1)
+            predecessor = mx.take_along_axis(
+                candidates[:, position], selected[:, None], axis=-1
+            )[:, 0]
+            path.append(predecessor)
+        return (
+            mx.stack(path, axis=1),
+            candidates,
+            mx.stack(probabilities, axis=1) if probabilities else None,
+        )
+
+
 class DFlashDraftModel(nn.Module):
+    layer_class = DFlashDecoderLayer
+
     def __init__(self, args: DFlashDraftModelArgs):
         super().__init__()
         self.args = args
         self.model_type = "dflash_qwen3"
         self.layers = [
-            DFlashDecoderLayer(args, layer_idx)
+            self.layer_class(args, layer_idx)
             for layer_idx in range(args.num_hidden_layers)
         ]
         target_layer_ids = list((args.dflash_config or {}).get("target_layer_ids") or ())
@@ -716,10 +917,13 @@ class DFlashDraftModel(nn.Module):
         self.block_size = int(args.block_size)
         self.mask_token_id = int((args.dflash_config or {}).get("mask_token_id", 0) or 0)
         self.embed_scale = 1.0
+        self.is_dflash2 = False
 
     def bind_target_model(self, target_model: Any, *, target_ops: Any) -> None:
         text_model = target_ops.text_model(target_model)
-        self.embed_scale = getattr(text_model, "embed_scale", 1.0)
+        self.embed_scale = getattr(text_model, "embed_scale", 1.0) * float(
+            (self.args.dflash_config or {}).get("input_embedding_scale", 1.0)
+        )
 
     def project_target_hidden(self, target_hidden: mx.array) -> mx.array:
         return self.hidden_norm(self.fc(target_hidden))
@@ -773,3 +977,27 @@ class DFlashDraftModel(nn.Module):
 
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
         return weights
+
+
+class DFlash2DraftModel(DFlashDraftModel):
+    layer_class = DFlash2DecoderLayer
+
+    def __init__(self, args: DFlashDraftModelArgs):
+        super().__init__(args)
+        self.model_type = "dflash2"
+        self.is_dflash2 = True
+        self.candidate_selector = CandidateSelector(args)
+
+    def select_candidates(
+        self,
+        hidden: mx.array,
+        logits: mx.array,
+        anchor_ids: mx.array,
+        temperature: float = 0.0,
+    ) -> tuple[mx.array, mx.array, Optional[mx.array]]:
+        return self.candidate_selector.select(
+            hidden,
+            logits,
+            anchor_ids,
+            temperature,
+        )

@@ -17,6 +17,8 @@ from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
 from dflash_mlx.cache.snapshot_service import SnapshotService
 from dflash_mlx.cache.store import PrefixSnapshotStore
+from dflash_mlx.diagnostics import DiagnosticsConfig, TraceConfig
+from dflash_mlx.engine import spec_epoch
 from dflash_mlx.engine.events import (
     CycleCompleteEvent,
     MemoryWaterfallEvent,
@@ -26,8 +28,6 @@ from dflash_mlx.engine.events import (
     SummaryEvent,
     TokenEvent,
 )
-from dflash_mlx.engine import spec_epoch
-from dflash_mlx.diagnostics import DiagnosticsConfig, TraceConfig
 from dflash_mlx.runtime.config import runtime_config_from_defaults
 from dflash_mlx.runtime.context import build_runtime_context
 
@@ -104,6 +104,20 @@ class _FakeDraftBackend:
     def draft_greedy(self, **_kwargs):
         block_len = int(_kwargs["block_len"])
         return mx.zeros((max(0, block_len - 1),), dtype=mx.uint32)
+
+    def draft_sample(self, **_kwargs):
+        draft_count = max(0, int(_kwargs["block_len"]) - 1)
+        drafted = mx.zeros((draft_count,), dtype=mx.uint32)
+        if _kwargs["draft_model"].is_dflash2:
+            probs = mx.ones((1, draft_count, 1), dtype=mx.float32)
+            indices = mx.zeros((1, draft_count, 1), dtype=mx.uint32)
+        else:
+            probs = mx.broadcast_to(
+                mx.array([[[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]]),
+                (1, draft_count, 8),
+            )
+            indices = None
+        return drafted, probs, indices
 
     def advance_context(self, **_kwargs) -> None:
         return None
@@ -192,11 +206,12 @@ def _runtime_context(
     )
 
 
-def _draft_model(*, block_size: int = 4):
+def _draft_model(*, block_size: int = 4, is_dflash2: bool = False):
     return SimpleNamespace(
         target_layer_ids=[0],
         block_size=block_size,
         mask_token_id=0,
+        is_dflash2=is_dflash2,
         project_target_hidden=lambda value: value,
     )
 
@@ -370,6 +385,30 @@ def test_dflash_stream_tokenizes_chat_template_without_override():
         ([{"role": "user", "content": "chat"}], True, True)
     ]
     assert prefill_event.prompt_token_count == 3
+
+
+def test_dflash2_sampling_runs_sparse_rejection_path_end_to_end():
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=_FakeTargetOps(),
+            tokenizer=object(),
+            draft_model=_draft_model(is_dflash2=True),
+            draft_backend=_FakeDraftBackend(),
+            prompt="unused",
+            max_new_tokens=5,
+            temperature=1.0,
+            top_p=0.95,
+            top_k=1,
+            prompt_tokens_override=[1, 2],
+            runtime_context=_runtime_context(),
+        )
+    )
+
+    token_ids = [event.token_id for event in events if isinstance(event, TokenEvent)]
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+    assert token_ids == [0, 0, 0, 0, 0]
+    assert summary.generation_tokens == 5
 
 
 def test_dflash_max_ctx_fallback_skips_session_request_materialization(monkeypatch):

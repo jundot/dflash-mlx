@@ -18,8 +18,8 @@ from dflash_mlx.engine.events import (
 )
 from dflash_mlx.engine.sampling import (
     build_suppress_token_mask,
-    greedy_tokens_with_mask,
     prepare_prompt_tokens,
+    sample_logits,
 )
 
 def _make_fallback_target_cache(
@@ -45,6 +45,9 @@ def stream_baseline_generate(
     use_chat_template: bool = False,
     stop_token_ids: Optional[list[int]] = None,
     suppress_token_ids: Optional[list[int]] = None,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
     prompt_tokens_override: Optional[list[int]] = None,
     quantize_kv_cache: bool = False,
     fallback_reason: Optional[str] = None,
@@ -70,7 +73,15 @@ def stream_baseline_generate(
     mx.eval(logits)
     prefill_ns = time.perf_counter_ns() - prefill_start_ns
     suppress_token_mask = build_suppress_token_mask(int(logits.shape[-1]), suppress_token_ids)
-    next_token = int(greedy_tokens_with_mask(logits[:, -1, :], suppress_token_mask).item())
+    next_token = int(
+        sample_logits(
+            logits[:, -1, :],
+            temperature,
+            top_p,
+            top_k,
+            suppress_token_mask,
+        ).item()
+    )
     generated_tokens = [next_token]
 
     _pre_yield = time.perf_counter_ns()
@@ -102,7 +113,15 @@ def stream_baseline_generate(
             break
         token_array = mx.array([[next_token]], dtype=mx.uint32)
         logits = target_model(token_array, cache=cache)
-        next_token = int(greedy_tokens_with_mask(logits[:, -1, :], suppress_token_mask).item())
+        next_token = int(
+            sample_logits(
+                logits[:, -1, :],
+                temperature,
+                top_p,
+                top_k,
+                suppress_token_mask,
+            ).item()
+        )
         generated_tokens.append(next_token)
         _pre_yield = time.perf_counter_ns()
         yield TokenEvent(
