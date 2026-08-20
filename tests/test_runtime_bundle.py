@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from dflash_mlx import verify_linear
 from dflash_mlx.runtime import bundle as runtime_bundle
 from dflash_mlx.runtime import stream_dflash_generate
 from dflash_mlx.runtime.registry import (
@@ -250,6 +251,100 @@ def test_runtime_bundle_applies_model_default_draft_quant(monkeypatch):
     assert bundle.effective_draft_quant == "w4"
     assert bundle.draft_meta["draft_quant_spec"] == "w4"
     assert bundle.draft_meta["draft_quant_source"] == "model_default"
+
+
+def test_runtime_bundle_reports_loader_adjusted_draft_quant(monkeypatch):
+    target_model = object()
+    tokenizer = object()
+    draft_model = SimpleNamespace(bound=False)
+    draft_backend = object()
+    ops = SimpleNamespace(family=lambda _target_model: "hybrid_gdn")
+
+    monkeypatch.setattr(
+        runtime_bundle,
+        "load_target_bundle",
+        lambda *args, **kwargs: _loaded_target(
+            target_model,
+            tokenizer,
+            {"resolved_model_ref": "Qwen/Qwen3.5-9B"},
+            ops,
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_bundle,
+        "load_draft_bundle",
+        lambda draft_ref, **kwargs: (
+            draft_model,
+            {
+                "resolved_model_ref": draft_ref,
+                "draft_quant_spec": "w4a32:gs64",
+            },
+        ),
+    )
+    monkeypatch.setattr(runtime_bundle, "bind_draft_to_target", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime_bundle, "EagerDraftBackend", lambda: draft_backend)
+
+    bundle = runtime_bundle.load_runtime_bundle(
+        model_ref="Qwen/Qwen3.5-9B",
+        draft_ref=None,
+    )
+
+    assert bundle.effective_draft_quant == "w4a32:gs64"
+    assert bundle.draft_meta["draft_quant_spec"] == "w4a32:gs64"
+    assert bundle.draft_meta["draft_quant_source"] == "model_default"
+
+
+def test_runtime_bundle_installs_old_apple_dflash2_logits_kernel(monkeypatch):
+    target_model = object()
+    tokenizer = object()
+    draft_model = SimpleNamespace(is_dflash2=True)
+    draft_backend = object()
+    ops = SimpleNamespace(family=lambda _target_model: "hybrid_gdn")
+    install_calls = []
+
+    monkeypatch.setattr(
+        runtime_bundle,
+        "load_target_bundle",
+        lambda *args, **kwargs: _loaded_target(
+            target_model,
+            tokenizer,
+            {
+                "resolved_model_ref": "unknown/model",
+                "verify_qmm_enabled": True,
+            },
+            ops,
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_bundle,
+        "load_draft_bundle",
+        lambda draft_ref, **kwargs: (
+            draft_model,
+            {
+                "resolved_model_ref": draft_ref,
+                "draft_load_dtype": "float32",
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        verify_linear,
+        "install_w4a32_draft_logits_linear",
+        lambda model, *, target_ops, enable_qmm: install_calls.append(
+            (model, target_ops, enable_qmm)
+        )
+        or 1,
+    )
+    monkeypatch.setattr(runtime_bundle, "bind_draft_to_target", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime_bundle, "EagerDraftBackend", lambda: draft_backend)
+
+    bundle = runtime_bundle.load_runtime_bundle(
+        model_ref="unknown/model",
+        draft_ref="manual/draft",
+        draft_quant="w4",
+    )
+
+    assert install_calls == [(target_model, ops, True)]
+    assert bundle.draft_meta["draft_logits_w4a32_swapped"] == 1
 
 
 def test_runtime_bundle_does_not_forward_sdpa_override(monkeypatch):
