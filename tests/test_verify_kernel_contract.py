@@ -55,6 +55,12 @@ DEV_BOUNDS = {
 }
 
 _GOLDENS: dict[str, dict[str, str]] = {
+    "applegpu_g13s": {
+        "m16_gate_up": "c8abc99131c6d3dbc43903c305a195dc3ba91473fe781a970ba41939e72335e0",
+        "m16_down": "2abf45acb6d9923e66530a069baa82faedd09ab7c8c8be192b9b7dc90f46145a",
+        "m4_gate_up": "e3fee4161dbcfe0938230dc140732210abd0b6a3022b37ef3b898ece443feea8",
+        "m4_down": "731fe6500783948cf17333352d5c22cc9b59ddc506c10033fd0ee7ba45c82c15",
+    },
     "applegpu_g17s": {
         "m16_gate_up": "dbb3c35f93a9e0678240675e6c7893bceaf9a5df549edc29963036869e009236",
         "m16_down": "969cb9327d6964d7b05506a36eba312365cd24962a78ee8116ac50736fde68af",

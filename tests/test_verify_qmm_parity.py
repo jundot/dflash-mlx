@@ -95,6 +95,15 @@ def test_m16_auto_prefers_nax_on_apple_g17(monkeypatch):
 
     assert verify_qmm._resolve_m16_ktmpl_variant(5120, 17408, 4) == "nax_ktmpl"
 
+def test_m16_auto_prefers_combo_on_apple_g13(monkeypatch):
+    monkeypatch.setattr(
+        verify_qmm.mx,
+        "device_info",
+        lambda: {"architecture": "applegpu_g13s"},
+    )
+
+    assert verify_qmm._resolve_m16_ktmpl_variant(5120, 17408, 4) == "combo_ktmpl"
+
 def test_m16_auto_keeps_steel_before_apple_g17(monkeypatch):
     monkeypatch.setattr(
         verify_qmm.mx,
