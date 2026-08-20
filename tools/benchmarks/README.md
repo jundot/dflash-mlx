@@ -15,6 +15,7 @@ PYTHONPATH=$PWD python -m tools.benchmarks.context_grid --help
 PYTHONPATH=$PWD python -m tools.benchmarks.prefix_cache_survival_gate --help
 PYTHONPATH=$PWD python -m tools.benchmarks.prefix_cache_probe --help
 PYTHONPATH=$PWD python -m tools.benchmarks.analyze_trace --help
+PYTHONPATH=$PWD python -m tools.benchmarks.verify_m8_microbench --help
 ```
 
 `agentic_trace.py`
@@ -39,6 +40,10 @@ long-lived process ladder.
 
 `analyze_trace.py`
 : Trace and prompt/memory analyzers.
+
+`verify_m8_microbench.py`
+: Compares the production M=8 verifier against production M=4 and stock MLX
+QMM. Select a single `--variant` when wrapping it in Metal System Trace.
 
 ## Capture vs replay
 
