@@ -45,6 +45,9 @@ PROD_SHAPES = [
     ("m16_down", 16, 17408, 5120),
     ("m4_gate_up", 4, 5120, 17408),
     ("m4_down", 4, 17408, 5120),
+    ("m8_gate_up", 8, 5120, 17408),
+    ("m8_down", 8, 17408, 5120),
+    ("m8_gdn_o", 8, 6144, 5120),
 ]
 
 DEV_BOUNDS = {
@@ -52,9 +55,17 @@ DEV_BOUNDS = {
     "m16_down": 2e-2,
     "m4_gate_up": 2e-3,
     "m4_down": 1e-3,
+    "m8_gate_up": 1e-3,
+    "m8_down": 1e-2,
+    "m8_gdn_o": 1e-2,
 }
 
 _GOLDENS: dict[str, dict[str, str]] = {
+    "applegpu_g13s": {
+        "m8_gate_up": "4dc80119205211b92c6d8f5f78145f0bda99efb7bc3f4a913417f8eb2cca40c1",
+        "m8_down": "0c9b8af31c7c3b323e45ba3e68cc201d093fe99ecf055c4dd9ca02537d53559e",
+        "m8_gdn_o": "a22927896a81c4c0fdc044f2e2de85490ab6ed52b606bd1757b3e748d70b87d9",
+    },
     "applegpu_g17s": {
         "m16_gate_up": "dbb3c35f93a9e0678240675e6c7893bceaf9a5df549edc29963036869e009236",
         "m16_down": "969cb9327d6964d7b05506a36eba312365cd24962a78ee8116ac50736fde68af",
@@ -159,9 +170,15 @@ def test_golden_fingerprint(name, M, K, N):
             f"no golden fingerprints for GPU profile {arch!r}; run with "
             "DFLASH_REGEN_KERNEL_GOLDENS=1 to generate them"
         )
-    assert profile[name] == digest, (
+    expected = profile.get(name)
+    if expected is None:
+        pytest.skip(
+            f"no golden fingerprint for {name!r} on GPU profile {arch!r}; run "
+            "with DFLASH_REGEN_KERNEL_GOLDENS=1 to generate it"
+        )
+    assert expected == digest, (
         f"{name} on {arch}: kernel output bytes changed "
-        f"(expected {profile[name][:12]}…, got {digest[:12]}…) — numeric "
+        f"(expected {expected[:12]}…, got {digest[:12]}…) — numeric "
         "drift from an MLX/Metal/kernel change; re-validate e2e GPU parity, "
         "then regenerate with DFLASH_REGEN_KERNEL_GOLDENS=1"
     )

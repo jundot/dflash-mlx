@@ -33,6 +33,79 @@ def _m4_ksplit_np_shape(K: int, N: int, bits: int) -> bool:
 def _m4_ksplit_np_kparts(N: int) -> int:
     return 2 if int(N) >= 4096 else 4
 
+def _m8_tuned_available() -> bool:
+    arch = str(mx.device_info().get("architecture", "")).lower()
+    return arch.startswith(("applegpu_g13", "applegpu_g14"))
+
+
+def _m8_tuned_config(K: int, N: int, bits: int) -> tuple[str, int, int] | None:
+    """Select the M1/M2 M=8 kernel morphology for a quantized projection.
+
+    The tuple is ``(variant, n_tile, k_parts)``. Qwen 3.5/3.8 target-verifier
+    shapes favor a scalar register tile on M1/M2; the 6144-wide output
+    projection is fastest without K splitting.
+    """
+    K = int(K)
+    N = int(N)
+    if (
+        not _m8_tuned_available()
+        or int(bits) != 4
+        or K % 32 != 0
+        or N % 4 != 0
+    ):
+        return None
+    if (K, N) == (6144, 5120):
+        return ("scalar", 4, 1)
+    if N < 256:
+        desired_k_parts = 8
+        n_tile = 1
+    elif N < 2048:
+        desired_k_parts = 1
+        n_tile = 2
+    else:
+        desired_k_parts = 2 if K >= 8192 or N < 12288 else 1
+        n_tile = 4
+    while desired_k_parts > 1 and K % (32 * desired_k_parts) != 0:
+        desired_k_parts //= 2
+    return ("scalar", n_tile, desired_k_parts)
+
+
+def _m8_w4a32_config(K: int, N: int, bits: int) -> tuple[str, int, int] | None:
+    """Select the profiled M=8 W4A32 kernel on M1/M2 GPUs.
+
+    DFlash2 uses FP32 activations on these GPUs because BF16 is emulated. Its
+    fixed projection shapes have a different optimum from target verification:
+    large projections benefit from FP16 matrix operands with FP32 accumulation,
+    while the dynamic-convolution projections remain faster in the exact scalar
+    kernel. The matrix path only affects draft predictions; target verification
+    still determines the emitted tokens.
+    """
+    K = int(K)
+    N = int(N)
+    if (
+        not _m8_tuned_available()
+        or int(bits) != 4
+        or K % 32 != 0
+        or N % 4 != 0
+    ):
+        return None
+
+    matrix_config = {
+        (5120, 17408): (32, 8),
+        (17408, 5120): (32, 2),
+        (5120, 4096): (16, 8),
+        (4096, 5120): (16, 16),
+        (5120, 1024): (32, 8),
+        (25600, 5120): (32, 2),
+        (5120, 248320): (32, 8),
+    }.get((K, N))
+    if matrix_config is not None:
+        n_tile, k_parts = matrix_config
+        return ("matrix_fp16", n_tile, k_parts)
+    if (K, N) == (5120, 1280):
+        return ("scalar", 4, 1)
+    return _m8_tuned_config(K, N, bits)
+
 def _m16_ktmpl_variant(K: int, N: int, bits: int) -> str | None:
     if int(bits) != 4:
         return None
@@ -332,6 +405,542 @@ def _build_kernel_m4_ksplit_np(
     )
     _VERIFY_KERNEL_CACHE[key] = kernel
     return kernel
+
+
+def _build_kernel_m8_scalar_tiled(
+    group_size: int,
+    dtype: mx.Dtype,
+    *,
+    k_parts: int,
+    n_tile: int,
+    k_value: int | None = None,
+    n_value: int | None = None,
+):
+    """Build the narrow-output register-tiled M=8 verifier."""
+    if n_tile not in (1, 2, 4):
+        raise ValueError(f"unsupported scalar M=8 N tile: {n_tile}")
+    if 32 * int(k_parts) > 1024:
+        raise ValueError("scalar M=8 threadgroup exceeds 1024 threads")
+
+    activation_loads = "\n".join(
+        f"Vec8 v{row} = xv[({row} * K + k_base) / 8];"
+        for row in range(8)
+    )
+    weight_steps = []
+    for col in range(n_tile):
+        fmas = "\n".join(
+            f"acc[{col * 8 + row}] += float(v{row}[ki]) * wv;"
+            for row in range(8)
+        )
+        weight_steps.append(
+            f"""
+            {{
+                int n_global = n0 + {col};
+                uint32_t packed = w_q[n_global * K_by_8 + pack];
+                float scale = float(scales[n_global * K_by_gs + (k_base / GS)]);
+                float bias = float(biases[n_global * K_by_gs + (k_base / GS)]);
+                _Pragma("unroll")
+                for (int ki = 0; ki < 8; ++ki) {{
+                    float wv = float((packed >> (ki * 4)) & 0xFu) * scale + bias;
+                    {fmas}
+                }}
+            }}
+            """
+        )
+    dequant_and_fma = "\n".join(weight_steps)
+
+    key = (
+        "m8_scalar_tiled",
+        group_size,
+        dtype,
+        int(k_parts),
+        int(n_tile),
+        int(k_value) if k_value is not None else None,
+        int(n_value) if n_value is not None else None,
+    )
+    if key in _VERIFY_KERNEL_CACHE:
+        return _VERIFY_KERNEL_CACHE[key]
+
+    source = f"""
+        using namespace metal;
+        constexpr int M = 8;
+        constexpr int RM = 8;
+        constexpr int BN = {int(n_tile)};
+        constexpr int K_PARTS = {int(k_parts)};
+        constexpr int GS = {group_size};
+        constexpr int ACC_COUNT = RM * BN;
+
+        uint part = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint tg_n = threadgroup_position_in_grid.y;
+
+        constexpr bool SPECIALIZED_K = {'true' if k_value is not None else 'false'};
+        constexpr bool SPECIALIZED_N = {'true' if n_value is not None else 'false'};
+        int K = SPECIALIZED_K ? {int(k_value or 0)} : int(K_size);
+        int N = SPECIALIZED_N ? {int(n_value or 0)} : int(N_size);
+        int K_by_8 = K / 8;
+        int K_by_gs = K / GS;
+        int n0 = int(tg_n) * BN;
+        int packs_per_part = K_by_8 / K_PARTS;
+        int pack_start = int(part) * packs_per_part;
+        int pack_end = pack_start + packs_per_part;
+
+        float acc[ACC_COUNT];
+        _Pragma("unroll")
+        for (int i = 0; i < ACC_COUNT; ++i) {{
+            acc[i] = 0.0f;
+        }}
+
+        using Vec8 = vec<T, 8>;
+        const device Vec8 *xv = reinterpret_cast<const device Vec8 *>(x);
+
+        for (int pack = pack_start + int(lane); pack < pack_end; pack += 32) {{
+            int k_base = pack * 8;
+            {activation_loads}
+            {dequant_and_fma}
+        }}
+
+        _Pragma("unroll")
+        for (int i = 0; i < ACC_COUNT; ++i) {{
+            acc[i] = simd_sum(acc[i]);
+        }}
+
+        threadgroup float partial[K_PARTS][ACC_COUNT];
+        if (lane == 0) {{
+            _Pragma("unroll")
+            for (int i = 0; i < ACC_COUNT; ++i) {{
+                partial[part][i] = acc[i];
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (part == 0 && lane < ACC_COUNT) {{
+            float total = 0.0f;
+            _Pragma("unroll")
+            for (int p = 0; p < K_PARTS; ++p) {{
+                total += partial[p][lane];
+            }}
+            int col = int(lane) / RM;
+            int row = int(lane) - col * RM;
+            y[row * N + n0 + col] = T(total);
+        }}
+    """
+
+    dtype_tag = {
+        mx.bfloat16: "bf16",
+        mx.float16: "fp16",
+        mx.float32: "fp32",
+    }.get(dtype, "unk")
+    kernel = mx.fast.metal_kernel(
+        name=(
+            f"verify_m8_scalar_n{int(n_tile)}_kp{int(k_parts)}_"
+            f"ks{int(k_value) if k_value is not None else 'dyn'}_"
+            f"ns{int(n_value) if n_value is not None else 'dyn'}_"
+            f"gs{group_size}_{dtype_tag}"
+        ),
+        input_names=["x", "w_q", "scales", "biases", "K_size", "N_size"],
+        output_names=["y"],
+        source=source,
+    )
+    _VERIFY_KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def _build_kernel_m8_scalar_kmajor(
+    group_size: int,
+    dtype: mx.Dtype,
+    *,
+    k_parts: int,
+    k_value: int | None = None,
+    n_value: int | None = None,
+):
+    """Build the profiled 8x4 verifier for M1/M2-class Apple GPUs.
+
+    Each lane walks a disjoint slice of packed K and keeps an 8x4 FP32
+    accumulator tile. Loading activations in K-major order lets all four
+    output columns reuse the same BF16-to-FP32 conversions. Production shapes
+    specialize K and N so Metal can fold indexing and bounds arithmetic.
+    """
+    if int(group_size) not in (32, 64, 128):
+        raise ValueError(f"unsupported group size: {group_size}")
+    if int(k_parts) < 1 or 32 * int(k_parts) > 1024:
+        raise ValueError(f"unsupported K partition count: {k_parts}")
+
+    key = (
+        "m8_scalar_kmajor",
+        int(group_size),
+        dtype,
+        int(k_parts),
+        int(k_value) if k_value is not None else None,
+        int(n_value) if n_value is not None else None,
+    )
+    if key in _VERIFY_KERNEL_CACHE:
+        return _VERIFY_KERNEL_CACHE[key]
+
+    activation_conversions = "\n".join(
+        f"float a{row} = float(v{row}[ki]);" for row in range(8)
+    )
+    weight_conversions = "\n".join(
+        f"float w{col} = float((packed{col} >> (ki * 4)) & 0xFu) "
+        f"* scale{col} + bias{col};"
+        for col in range(4)
+    )
+    fmas = "\n".join(
+        f"acc[{col * 8 + row}] += a{row} * w{col};"
+        for col in range(4)
+        for row in range(8)
+    )
+    group_shift = {32: 2, 64: 3, 128: 4}[int(group_size)]
+
+    if int(k_parts) == 1:
+        reduction_and_store = """
+        _Pragma("unroll")
+        for (int i = 0; i < ACC_COUNT; ++i) {
+            acc[i] = simd_sum(acc[i]);
+        }
+
+        int output_idx = int(lane);
+        int col = output_idx / M;
+        int row = output_idx - col * M;
+        y[row * N + n0 + col] = T(acc[output_idx]);
+        """
+    else:
+        reduction_and_store = """
+        _Pragma("unroll")
+        for (int i = 0; i < ACC_COUNT; ++i) {
+            acc[i] = simd_sum(acc[i]);
+        }
+
+        threadgroup float partial[K_PARTS][ACC_COUNT];
+        if (lane == 0) {
+            _Pragma("unroll")
+            for (int i = 0; i < ACC_COUNT; ++i) {
+                partial[part][i] = acc[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (part == 0) {
+            int output_idx = int(lane);
+            float total = 0.0f;
+            _Pragma("unroll")
+            for (int p = 0; p < K_PARTS; ++p) {
+                total += partial[p][output_idx];
+            }
+            int col = output_idx / M;
+            int row = output_idx - col * M;
+            y[row * N + n0 + col] = T(total);
+        }
+        """
+
+    source = f"""
+        using namespace metal;
+        constexpr int M = 8;
+        constexpr int BN = 4;
+        constexpr int K_PARTS = {int(k_parts)};
+        constexpr int GS = {int(group_size)};
+        constexpr int ACC_COUNT = M * BN;
+
+        uint part = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint tg_n = threadgroup_position_in_grid.y;
+
+        int K = {'int(K_size)' if k_value is None else int(k_value)};
+        int N = {'int(N_size)' if n_value is None else int(n_value)};
+        int K_by_8 = K / 8;
+        int K_by_gs = K / GS;
+        int n0 = int(tg_n) * BN;
+        int packs_per_part = K_by_8 / K_PARTS;
+        int pack_start = int(part) * packs_per_part;
+        int pack_end = pack_start + packs_per_part;
+
+        float acc[ACC_COUNT];
+        _Pragma("unroll")
+        for (int i = 0; i < ACC_COUNT; ++i) {{
+            acc[i] = 0.0f;
+        }}
+
+        using Vec8 = vec<T, 8>;
+        const device Vec8 *xv = reinterpret_cast<const device Vec8 *>(x);
+
+        for (int pack = pack_start + int(lane); pack < pack_end; pack += 32) {{
+            Vec8 v0 = xv[0 * K_by_8 + pack];
+            Vec8 v1 = xv[1 * K_by_8 + pack];
+            Vec8 v2 = xv[2 * K_by_8 + pack];
+            Vec8 v3 = xv[3 * K_by_8 + pack];
+            Vec8 v4 = xv[4 * K_by_8 + pack];
+            Vec8 v5 = xv[5 * K_by_8 + pack];
+            Vec8 v6 = xv[6 * K_by_8 + pack];
+            Vec8 v7 = xv[7 * K_by_8 + pack];
+
+            uint32_t packed0 = w_q[(n0 + 0) * K_by_8 + pack];
+            uint32_t packed1 = w_q[(n0 + 1) * K_by_8 + pack];
+            uint32_t packed2 = w_q[(n0 + 2) * K_by_8 + pack];
+            uint32_t packed3 = w_q[(n0 + 3) * K_by_8 + pack];
+            int group = pack >> {group_shift};
+            float scale0 = float(scales[(n0 + 0) * K_by_gs + group]);
+            float scale1 = float(scales[(n0 + 1) * K_by_gs + group]);
+            float scale2 = float(scales[(n0 + 2) * K_by_gs + group]);
+            float scale3 = float(scales[(n0 + 3) * K_by_gs + group]);
+            float bias0 = float(biases[(n0 + 0) * K_by_gs + group]);
+            float bias1 = float(biases[(n0 + 1) * K_by_gs + group]);
+            float bias2 = float(biases[(n0 + 2) * K_by_gs + group]);
+            float bias3 = float(biases[(n0 + 3) * K_by_gs + group]);
+
+            _Pragma("unroll")
+            for (int ki = 0; ki < 8; ++ki) {{
+                {activation_conversions}
+                {weight_conversions}
+                {fmas}
+            }}
+        }}
+
+        {reduction_and_store}
+    """
+
+    dtype_tag = {
+        mx.bfloat16: "bf16",
+        mx.float16: "fp16",
+        mx.float32: "fp32",
+    }.get(dtype, "unk")
+    kernel = mx.fast.metal_kernel(
+        name=(
+            f"verify_m8_scalar_kmajor_kp{int(k_parts)}_"
+            f"k{int(k_value) if k_value is not None else 'dyn'}_"
+            f"n{int(n_value) if n_value is not None else 'dyn'}_"
+            f"gs{group_size}_{dtype_tag}"
+        ),
+        input_names=["x", "w_q", "scales", "biases", "K_size", "N_size"],
+        output_names=["y"],
+        source=source,
+    )
+    _VERIFY_KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def _build_kernel_m8_ksplit_fp16(
+    group_size: int,
+    dtype: mx.Dtype,
+    *,
+    k_parts: int,
+    n_tile: int = 16,
+    k_value: int | None = None,
+    n_value: int | None = None,
+):
+    """Build the profiled M=8 matrix verifier for M1/M2-class Apple GPUs.
+
+    Each simdgroup owns one K partition and computes an 8x16 or 8x32 output
+    tile with native 8x8 matrix accumulators. Activations and dequantized
+    weights are staged as FP16, while accumulation and cross-part reduction
+    remain FP32. This morphology is selected only for the measured 6144-wide
+    output-projection shape.
+    """
+    if int(k_parts) < 1 or 32 * int(k_parts) > 1024:
+        raise ValueError(f"unsupported K partition count: {k_parts}")
+    if int(n_tile) not in (16, 32):
+        raise ValueError(f"unsupported matrix M=8 N tile: {n_tile}")
+    threadgroup_bytes = int(k_parts) * (
+        8 * 32 * 2
+        + 32 * int(n_tile) * 2
+        + 8 * int(n_tile) * 4
+    )
+    if threadgroup_bytes > 32 * 1024:
+        raise ValueError(
+            f"matrix M=8 threadgroup uses {threadgroup_bytes} bytes"
+        )
+
+    key = (
+        "m8_ksplit_fp16",
+        int(group_size),
+        dtype,
+        int(k_parts),
+        int(n_tile),
+        int(k_value) if k_value is not None else None,
+        int(n_value) if n_value is not None else None,
+    )
+    if key in _VERIFY_KERNEL_CACHE:
+        return _VERIFY_KERNEL_CACHE[key]
+
+    accumulators = "\n".join(
+        f"simdgroup_matrix<float, 8, 8> c{index} = "
+        "simdgroup_matrix<float, 8, 8>(0.0f);"
+        for index in range(int(n_tile) // 8)
+    )
+    matrix_steps = "\n".join(
+        f"""
+                simdgroup_load(
+                    b, b_tile[part] + ks * BK_SUB * BN + {index * 8}, BN
+                );
+                simdgroup_multiply_accumulate(c{index}, a, b, c{index});
+        """
+        for index in range(int(n_tile) // 8)
+    )
+    matrix_stores = "\n".join(
+        f"simdgroup_store(c{index}, partial[part] + {index * 8}, BN);"
+        for index in range(int(n_tile) // 8)
+    )
+    source = f"""
+        using namespace metal;
+        constexpr int M = 8;
+        constexpr int BN = {int(n_tile)};
+        constexpr int BK = 32;
+        constexpr int BK_SUB = 8;
+        constexpr int K_PARTS = {int(k_parts)};
+        constexpr int GS = {int(group_size)};
+
+        uint tid = thread_position_in_threadgroup.x;
+        uint part = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint tg_n = threadgroup_position_in_grid.y;
+
+        int K = {'int(K_size)' if k_value is None else int(k_value)};
+        int N = {'int(N_size)' if n_value is None else int(n_value)};
+        int K_by_8 = K / 8;
+        int K_by_gs = K / GS;
+        int n0 = int(tg_n) * BN;
+        int k_chunk = K / K_PARTS;
+        int k_begin = int(part) * k_chunk;
+        int k_end = k_begin + k_chunk;
+
+        threadgroup half x_tile[K_PARTS][M * BK];
+        threadgroup half b_tile[K_PARTS][BK * BN];
+        threadgroup float partial[K_PARTS][M * BN];
+
+        simdgroup_matrix<half, 8, 8> a, b;
+        {accumulators}
+
+        using XVec = vec<T, 8>;
+        using HVec = vec<half, 8>;
+        const device XVec *x_vec = reinterpret_cast<const device XVec *>(x);
+
+        for (int k0 = k_begin; k0 < k_end; k0 += BK) {{
+            _Pragma("unroll")
+            for (int x_slot = int(lane); x_slot < M * BK / 8;
+                 x_slot += 32) {{
+                int x_row = x_slot / (BK / 8);
+                int x_pack = x_slot - x_row * (BK / 8);
+                XVec x_values =
+                    x_vec[(x_row * K + k0 + x_pack * 8) / 8];
+                *reinterpret_cast<threadgroup HVec *>(
+                    x_tile[part] + x_row * BK + x_pack * 8
+                ) = HVec(x_values);
+            }}
+
+            float lane_scale = 0.0f;
+            float lane_bias = 0.0f;
+            if (lane < BN) {{
+                int group_index = int(k0 / GS);
+                lane_scale =
+                    float(scales[(n0 + int(lane)) * K_by_gs + group_index]);
+                lane_bias =
+                    float(biases[(n0 + int(lane)) * K_by_gs + group_index]);
+            }}
+
+            _Pragma("unroll")
+            for (int pack_idx = 0; pack_idx < BK * BN / (32 * 8);
+                 ++pack_idx) {{
+                int packed_slot = pack_idx * 32 + int(lane);
+                int dq_k = packed_slot / BN;
+                int dq_n = packed_slot - dq_k * BN;
+                int n_global = n0 + dq_n;
+                int k_base = k0 + dq_k * 8;
+                uint32_t packed =
+                    w_q[n_global * K_by_8 + (k_base >> 3)];
+                float scale = simd_shuffle(lane_scale, dq_n);
+                float bias = simd_shuffle(lane_bias, dq_n);
+                _Pragma("unroll")
+                for (int ki = 0; ki < 8; ++ki) {{
+                    uint32_t nibble = (packed >> (ki * 4)) & 0xFu;
+                    b_tile[part][(dq_k * 8 + ki) * BN + dq_n] =
+                        half(float(nibble) * scale + bias);
+                }}
+            }}
+
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            _Pragma("unroll")
+            for (int ks = 0; ks < BK / BK_SUB; ++ks) {{
+                simdgroup_load(a, x_tile[part] + ks * BK_SUB, BK);
+                {matrix_steps}
+            }}
+
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+
+        {matrix_stores}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint output_idx = tid; output_idx < M * BN;
+             output_idx += K_PARTS * 32) {{
+            float total = 0.0f;
+            _Pragma("unroll")
+            for (int p = 0; p < K_PARTS; ++p) {{
+                total += partial[p][output_idx];
+            }}
+            int row = int(output_idx) / BN;
+            int col = int(output_idx) - row * BN;
+            y[row * N + n0 + col] = T(total);
+        }}
+    """
+
+    dtype_tag = {
+        mx.bfloat16: "bf16",
+        mx.float16: "fp16",
+        mx.float32: "fp32",
+    }.get(dtype, "unk")
+    kernel = mx.fast.metal_kernel(
+        name=(
+            f"verify_m8_ksplit_fp16_kp{int(k_parts)}_"
+            f"nt{int(n_tile)}_"
+            f"k{int(k_value) if k_value is not None else 'dyn'}_"
+            f"n{int(n_value) if n_value is not None else 'dyn'}_"
+            f"gs{group_size}_{dtype_tag}"
+        ),
+        input_names=["x", "w_q", "scales", "biases", "K_size", "N_size"],
+        output_names=["y"],
+        source=source,
+    )
+    _VERIFY_KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def _build_kernel_m8_tuned(
+    group_size: int,
+    dtype: mx.Dtype,
+    K: int,
+    N: int,
+    config: tuple[str, int, int],
+):
+    """Build the kernel selected by :func:`_m8_tuned_config`."""
+    variant, n_tile, k_parts = config
+    if variant == "matrix_fp16":
+        return _build_kernel_m8_ksplit_fp16(
+            group_size,
+            dtype,
+            k_parts=k_parts,
+            n_tile=n_tile,
+            k_value=K,
+            n_value=N,
+        )
+    if variant != "scalar":
+        raise ValueError(f"unsupported tuned M=8 variant: {variant}")
+    if n_tile == 4:
+        return _build_kernel_m8_scalar_kmajor(
+            group_size,
+            dtype,
+            k_parts=k_parts,
+            k_value=K,
+            n_value=N,
+        )
+    return _build_kernel_m8_scalar_tiled(
+        group_size,
+        dtype,
+        k_parts=k_parts,
+        n_tile=n_tile,
+        k_value=K,
+        n_value=N,
+    )
+
 
 def _build_kernel_m16_combo_ktmpl(k_val: int, group_size: int, dtype: mx.Dtype):
     key = ("m16_combo_ktmpl", int(k_val), group_size, dtype)
@@ -1040,7 +1649,7 @@ def _should_use_verify(
     m = 1
     for d in x.shape[:-1]:
         m *= d
-    return m in (4, 16)
+    return m in (4, 8, 16)
 
 def verify_matmul(
     x: mx.array,
@@ -1084,6 +1693,32 @@ def verify_matmul(
             template=[("T", x.dtype)],
             grid=(32 * k_parts, N // 4, 1),
             threadgroup=(32 * k_parts, 1, 1),
+            output_shapes=[(M, N)],
+            output_dtypes=[x.dtype],
+        )
+        return y.reshape(*orig_shape[:-1], N)
+
+    if M == 8:
+        m8_config = _m8_tuned_config(K, N, bits)
+        if m8_config is None:
+            return mx.quantized_matmul(
+                x, w, scales=scales, biases=biases,
+                transpose=transpose, group_size=group_size, bits=bits,
+            )
+        _, n_tile, k_parts = m8_config
+        kernel = _build_kernel_m8_tuned(
+            group_size,
+            x.dtype,
+            K,
+            N,
+            m8_config,
+        )
+        threadgroup_size = 32 * k_parts
+        (y,) = kernel(
+            inputs=[x2, w_q, scales, biases, K, N],
+            template=[("T", x.dtype)],
+            grid=(threadgroup_size, N // n_tile, 1),
+            threadgroup=(threadgroup_size, 1, 1),
             output_shapes=[(M, N)],
             output_dtypes=[x.dtype],
         )
