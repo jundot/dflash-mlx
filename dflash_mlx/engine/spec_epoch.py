@@ -70,6 +70,16 @@ from dflash_mlx.engine.config import (
     resolve_speculative_cycle_config,
     verify_token_count_for_block,
 )
+
+
+def _detect_chip_best_effort() -> Any:
+    """Chip profile for kernel-heuristic caps; None when detection fails."""
+    try:
+        from dflash_mlx.runtime.chip_detect import detect_chip
+
+        return detect_chip()
+    except Exception:
+        return None
 from dflash_mlx.engine.events import (
     CycleCompleteEvent,
     EngineEvent,
@@ -646,6 +656,7 @@ class SpeculativeSession:
     copyspec_index: CopySpecIndex
     copyspec_mode: str
     capture_logits: bool = False
+    chip_profile: Any = None
 
     @classmethod
     def open(
@@ -744,6 +755,7 @@ class SpeculativeSession:
             target_fa_window=target_fa_window,
             copyspec_index=CopySpecIndex(prompt_tokens),
             copyspec_mode=str(getattr(runtime_config, "copyspec_mode", "conservative")),
+            chip_profile=_detect_chip_best_effort(),
         )
 
     def clear_cache_boundary(self) -> None:
@@ -1293,6 +1305,7 @@ class SpeculativeSession:
             runtime_config,
             draft_model,
             block_tokens,
+            chip_profile=self.chip_profile,
         )
         effective_block_tokens = cycle_config.effective_block_tokens
         verify_len_cap = cycle_config.verify_len_cap
@@ -2002,6 +2015,7 @@ class SpeculativeSession:
             runtime_config,
             draft_model,
             block_tokens,
+            chip_profile=self.chip_profile,
         )
         effective_block_tokens = cycle_config.effective_block_tokens
         adaptive_block_policy = _AdaptiveBlockPolicy.from_runtime(
