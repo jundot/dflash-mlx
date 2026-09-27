@@ -55,9 +55,19 @@ class MuseGlimmerTargetOps:
             return False
         args = getattr(self.text_wrapper(target_model), "args", None)
         layer_types = tuple(getattr(args, "layer_types", None) or ())
+        # _layer_masks routes sliding/full masks through the attention-layer
+        # indices on the text model, so those attributes are part of the
+        # contract, not an implementation detail. mlx-lm 0.32 ships its own
+        # models/muse_glimmer.py that builds masks per layer type and exposes
+        # none of them: declining here means resolve_target_ops fails fast at
+        # load with a readable message, instead of raising AttributeError
+        # mid-decode and stranding the engine in fallback.
         return (
             hasattr(inner, "layers")
             and hasattr(inner, "embed_tokens")
+            and hasattr(inner, "full_attention_idx")
+            and hasattr(inner, "sliding_attention_idx")
+            and hasattr(inner, "sliding_window")
             and "sliding_attention" in layer_types
             and "full_attention" in layer_types
         )

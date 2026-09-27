@@ -9,7 +9,10 @@ import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 
-from dflash_mlx.engine.target_muse_glimmer import MuseGlimmerTargetOps
+from dflash_mlx.engine.target_muse_glimmer import (
+    MuseGlimmerTargetOps,
+    _MUSE_MODEL_TYPES,
+)
 from dflash_mlx.engine.target_ops import resolve_target_ops
 from dflash_mlx.models import muse_glimmer as muse_module
 from dflash_mlx.models.muse_glimmer import Model, ModelArgs
@@ -204,6 +207,32 @@ class TestTargetOps:
         assert caps.supports_dflash
         assert caps.supports_kv_trim
         assert caps.supports_prefix_snapshot
+
+    def test_declines_target_without_attention_layer_indices(self):
+        """A Glimmer text model that routes masks another way is declined at load.
+
+        mlx-lm 0.32 added its own models/muse_glimmer.py, which builds masks per
+        layer type and exposes neither full_attention_idx nor
+        sliding_attention_idx/sliding_window. Accepting that shape would raise
+        AttributeError from _layer_masks in the middle of decode and strand the
+        engine in fallback; refusing it makes resolve_target_ops fail fast with a
+        readable message instead.
+        """
+        model = _tiny_model()
+        inner = model.model
+        for attr in (
+            "full_attention_idx",
+            "sliding_attention_idx",
+            "sliding_window",
+        ):
+            assert attr in vars(inner)
+            delattr(inner, attr)
+
+        ops = MuseGlimmerTargetOps()
+        assert ops.model_type(model) in _MUSE_MODEL_TYPES
+        assert ops.supports_model(model) is False
+        with pytest.raises(NotImplementedError, match="Unsupported target architecture"):
+            resolve_target_ops(model)
 
     def test_snapshot_round_trip_matches_fresh_continuation(self):
         """A prefill snapshot hydrates back to the same continuation logits.
