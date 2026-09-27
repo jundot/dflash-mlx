@@ -2,13 +2,14 @@
 # Licensed under the Apache License, Version 2.0 - see LICENSE file
 """Text-only Muse Glimmer (Meta) backbone, loadable through mlx-lm.
 
-Neither mlx-lm nor mlx-vlm ships a ``muse_glimmer`` module at the pinned
-versions, and ``load_target_bundle`` loads DFlash targets through
+Neither mlx-lm's ``muse_glimmer`` (added in 0.32.0, oMLX 0.7.0rc1's pin) nor
+mlx-vlm's carries the logit tail and attention-layer indices that the DFlash
+target backend needs, and ``load_target_bundle`` loads DFlash targets through
 ``mlx_lm.utils.load`` only. This module implements the 52-layer text
 backbone of ``MuseGlimmerForConditionalGeneration`` checkpoints (vision
 weights are dropped in ``sanitize``) and registers itself into
-``sys.modules["mlx_lm.models.muse_glimmer"]``, yielding automatically
-once upstream mlx-lm ships the family.
+``sys.modules["mlx_lm.models.muse_glimmer"]``, yielding to upstream only once
+that module actually carries the tail (see ``register_into_mlx_lm``).
 
 The layer implementation is adapted from the mlx-vlm muse_glimmer port
 (mlx-vlm PR #1838 + #1839): gated GQA with a shared weightless qk norm
@@ -431,21 +432,54 @@ class Model(nn.Module):
         return sanitized
 
 
+def _upstream_impl_supports_dflash(module: Any) -> bool:
+    """True when an upstream ``mlx_lm.models.muse_glimmer`` can serve as a target.
+
+    ``MuseGlimmerTargetOps`` delegates the logit tail to ``Model.logits_tail``
+    (lm_head -> output_multiplier -> tanh softcap) so verify logits can never
+    drift from generation logits, and builds its sliding/full masks from the
+    ``full_attention_idx`` / ``sliding_attention_idx`` the bundled model exposes.
+    mlx-lm 872ae88 (0.32.0) ships its own ``models/muse_glimmer.py`` with
+    neither, so yielding to it leaves every DFlash decode raising AttributeError
+    on ``full_attention_idx``.
+
+    A module with no ``Model`` at all is not an mlx-lm model module (partially
+    initialised import, test double): don't argue with it, stand down.
+    """
+    model_cls = getattr(module, "Model", None)
+    if model_cls is None:
+        return True
+    return hasattr(model_cls, "logits_tail")
+
+
 def register_into_mlx_lm() -> bool:
     """Seed ``mlx_lm.models.muse_glimmer`` so mlx-lm can load the target.
 
-    Yields to a real upstream module: registration is skipped when
-    ``mlx_lm.models.muse_glimmer`` is already importable.
+    Yields to a real upstream module only while that module is usable as a
+    DFlash target (see ``_upstream_impl_supports_dflash``); otherwise this
+    bundled implementation keeps ownership of the module name.
     """
     import importlib.util
 
     name = "mlx_lm.models.muse_glimmer"
-    if name in sys.modules:
-        return False
-    try:
-        if importlib.util.find_spec(name) is not None:
+    bundled = sys.modules[__name__]
+
+    existing = sys.modules.get(name)
+    if existing is not None and existing is not bundled:
+        if _upstream_impl_supports_dflash(existing):
             return False
-    except (ImportError, ModuleNotFoundError):
-        pass
-    sys.modules[name] = sys.modules[__name__]
+    else:
+        try:
+            has_upstream = importlib.util.find_spec(name) is not None
+        except (ImportError, ModuleNotFoundError, ValueError):
+            has_upstream = False
+        if has_upstream:
+            try:
+                module = importlib.import_module(name)
+            except Exception:  # noqa: BLE001 - unimportable is not usable
+                module = None
+            if module is not None and _upstream_impl_supports_dflash(module):
+                return False
+
+    sys.modules[name] = bundled
     return True

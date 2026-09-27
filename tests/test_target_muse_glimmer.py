@@ -3,6 +3,7 @@
 
 import json
 import sys
+import types
 from pathlib import Path
 
 import mlx.core as mx
@@ -139,6 +140,54 @@ class TestModule:
         try:
             assert muse_module.register_into_mlx_lm() is False
             assert sys.modules[name] is sentinel
+        finally:
+            del sys.modules[name]
+            if saved is not None:
+                sys.modules[name] = saved
+
+    def test_register_yields_to_usable_upstream(self):
+        # An upstream module that carries the surface MuseGlimmerTargetOps
+        # needs (Model.logits_tail) is the one registration should stand down
+        # for.
+        name = "mlx_lm.models.muse_glimmer"
+        saved = sys.modules.pop(name, None)
+        upstream = types.ModuleType(name)
+
+        class Model:
+            def logits_tail(self, hidden_states):
+                return hidden_states
+
+        upstream.Model = Model
+        sys.modules[name] = upstream
+        try:
+            assert muse_module.register_into_mlx_lm() is False
+            assert sys.modules[name] is upstream
+        finally:
+            del sys.modules[name]
+            if saved is not None:
+                sys.modules[name] = saved
+
+    def test_register_overrides_unusable_upstream(self):
+        # oMLX 0.7.0rc1 pins mlx-lm 872ae88, which ships models/muse_glimmer.py
+        # with a MuseGlimmerModel that has neither logits_tail nor
+        # full_attention_idx. Yielding to it leaves the DFlash target on a model
+        # whose masks cannot be built: the first decode raises
+        # AttributeError: 'MuseGlimmerModel' object has no attribute
+        # 'full_attention_idx'. The bundled implementation has to keep
+        # ownership until upstream carries the tail.
+        name = "mlx_lm.models.muse_glimmer"
+        saved = sys.modules.pop(name, None)
+        upstream = types.ModuleType(name)
+
+        class Model:
+            def __call__(self, inputs, cache=None):
+                return inputs
+
+        upstream.Model = Model
+        sys.modules[name] = upstream
+        try:
+            assert muse_module.register_into_mlx_lm() is True
+            assert sys.modules[name] is muse_module
         finally:
             del sys.modules[name]
             if saved is not None:
