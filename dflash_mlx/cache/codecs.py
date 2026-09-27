@@ -227,13 +227,22 @@ def serialize_target_cache(
                 )
                 gdn.append(None)
         elif isinstance(entry, KVCache):
-            state = entry.state
-            if state is None or state[0] is None:
+            # mlx-lm 0.32 pre-allocates FA buffers in ``step``-sized blocks and
+            # widened ``state`` to (keys, values, offset), so the raw arrays can
+            # be longer than the live offset. Snapshots must hold exact-length
+            # arrays (hydrate_target_cache refuses padded ones), so take the
+            # trimmed view: ``keys_and_values()`` on 0.32+, ``state`` on 0.31.
+            keys = getattr(entry, "keys", None)
+            values = getattr(entry, "values", None)
+            if keys is None or values is None:
                 fa.append(None)
                 gdn.append(None)
             else:
-                k, v = state
-                fa.append((grab(k), grab(v), int(entry.offset)))
+                if hasattr(entry, "keys_and_values"):
+                    keys, values = entry.keys_and_values()
+                else:
+                    keys, values = entry.state[:2]
+                fa.append((grab(keys), grab(values), int(entry.offset)))
                 gdn.append(None)
         else:
             raise TypeError(

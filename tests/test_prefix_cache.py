@@ -44,6 +44,15 @@ def _make_kv_cache_populated(n_tokens: int = 4, hkv: int = 2, d: int = 8) -> KVC
     mx.eval(cache.keys, cache.values)
     return cache
 
+def _state_pair(cache: KVCache) -> tuple[mx.array, mx.array]:
+    """(keys, values) from ``cache.state`` across mlx-lm versions.
+
+    0.31 returns the pair; 0.32 returns (keys, values, offset).
+    """
+    state = cache.state
+    return state[0], state[1]
+
+
 def _make_rotating_cache_populated(
     n_tokens: int = 7,
     *,
@@ -508,6 +517,25 @@ def test_prefix_snapshot_builder_matches_build_snapshot_shape():
     assert not mx.all(snap_k == 0).item()
 
 class TestSerializeHydrate:
+    def test_serialize_trims_padded_live_buffers(self):
+        # mlx-lm 0.32 pre-allocates KVCache buffers in ``step``-sized blocks, so a
+        # cache at offset 5 can hold arrays with shape[2] == 256. A snapshot has
+        # to carry the live tokens only: hydrate_target_cache refuses anything
+        # longer than the recorded offset ("not exact-length ... cannot adopt").
+        cache = KVCache()
+        for _ in range(5):
+            k = mx.zeros((1, 2, 1, 8), dtype=mx.float32)
+            v = mx.zeros((1, 2, 1, 8), dtype=mx.float32)
+            cache.update_and_fetch(k, v)
+        assert cache.offset == 5
+
+        fa, gdn = serialize_target_cache([cache])
+        assert gdn[0] is None
+        snap_k, snap_v, offset = fa[0]
+        assert offset == 5
+        assert int(snap_k.shape[2]) == 5
+        assert int(snap_v.shape[2]) == 5
+
     def test_kv_only_round_trip(self):
         src = [_make_kv_cache_populated(n_tokens=5)]
         fa, gdn = serialize_target_cache(src)
@@ -529,8 +557,8 @@ class TestSerializeHydrate:
         assert isinstance(hydrated[0], KVCache)
         assert hydrated[0].offset == 5
 
-        src_k, src_v = src[0].state
-        h_k, h_v = hydrated[0].state
+        src_k, src_v = _state_pair(src[0])
+        h_k, h_v = _state_pair(hydrated[0])
         assert mx.all(src_k == h_k).item()
         assert mx.all(src_v == h_v).item()
 
@@ -553,8 +581,8 @@ class TestSerializeHydrate:
             key=_make_key(),
         )
         hydrated = hydrate_target_cache(snapshot, template)
-        src_k, src_v = src[0].state
-        h_k, h_v = hydrated[0].state
+        src_k, src_v = _state_pair(src[0])
+        h_k, h_v = _state_pair(hydrated[0])
         assert mx.all(src_k == h_k).item()
         assert mx.all(src_v == h_v).item()
 
