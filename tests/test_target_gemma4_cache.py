@@ -52,7 +52,13 @@ def _temporal_key_values(cache: RotatingKVCache) -> list[int]:
     return np.array(keys).reshape(-1).astype(int).tolist()
 
 def _state_key_values(cache: KVCache) -> list[int]:
-    keys, _ = cache.state
+    # mlx-lm 0.32 widened ``state`` to (keys, values, offset) and keeps the
+    # padded ``step``-block buffers in it; the live tokens come from
+    # ``keys_and_values()``. 0.31's ``state`` pair is already the live view.
+    if hasattr(cache, "keys_and_values") and cache.keys is not None:
+        keys, _ = cache.keys_and_values()
+    else:
+        keys = cache.state[0]
     mx.eval(keys)
     return np.array(keys).reshape(-1).astype(int).tolist()
 
