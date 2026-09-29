@@ -55,9 +55,19 @@ class MuseGlimmerTargetOps:
             return False
         args = getattr(self.text_wrapper(target_model), "args", None)
         layer_types = tuple(getattr(args, "layer_types", None) or ())
+        # _layer_masks routes sliding/full masks through the attention-layer
+        # indices on the text model, so those attributes are part of the
+        # contract, not an implementation detail. mlx-lm 0.32 ships its own
+        # models/muse_glimmer.py that builds masks per layer type and exposes
+        # none of them: declining here means resolve_target_ops fails fast at
+        # load with a readable message, instead of raising AttributeError
+        # mid-decode and stranding the engine in fallback.
         return (
             hasattr(inner, "layers")
             and hasattr(inner, "embed_tokens")
+            and hasattr(inner, "full_attention_idx")
+            and hasattr(inner, "sliding_attention_idx")
+            and hasattr(inner, "sliding_window")
             and "sliding_attention" in layer_types
             and "full_attention" in layer_types
         )
@@ -66,14 +76,16 @@ class MuseGlimmerTargetOps:
         return "muse_glimmer_swa"
 
     def capabilities_for(self, target_model: Any) -> TargetCapabilities:
-        # Conservative bring-up surface: snapshots and verify linears stay
-        # off until they get muse-specific round-trip coverage.
+        # Snapshot round-trip coverage landed with
+        # test_snapshot_round_trip_matches_fresh_continuation (mixed
+        # sliding/full caches, rotating ring index, offsets). Verify
+        # linears stay off (no muse-specific linear-cache coverage).
         return TargetCapabilities(
             supports_dflash=True,
             supports_recurrent_rollback=False,
             supports_kv_trim=True,
-            supports_prefix_snapshot=False,
-            supports_rotating_cache_snapshot=False,
+            supports_prefix_snapshot=True,
+            supports_rotating_cache_snapshot=True,
             supports_shared_kv=False,
             supports_target_hidden_capture=True,
             supports_verify_linear=False,
