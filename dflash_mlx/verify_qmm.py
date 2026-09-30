@@ -33,6 +33,11 @@ def _m4_ksplit_np_shape(K: int, N: int, bits: int) -> bool:
 def _m4_ksplit_np_kparts(N: int) -> int:
     return 2 if int(N) >= 4096 else 4
 
+def _m16_combo_preferred() -> bool:
+    """Use the precise, faster M=16 kernel on M1 GPUs."""
+    arch = str(mx.device_info().get("architecture", "")).lower()
+    return arch.startswith("applegpu_g13")
+
 def _m16_ktmpl_variant(K: int, N: int, bits: int) -> str | None:
     if int(bits) != 4:
         return None
@@ -40,6 +45,11 @@ def _m16_ktmpl_variant(K: int, N: int, bits: int) -> str | None:
         return None
     if int(N) % 32 == 0 and _nax_verify_available():
         return "nax_ktmpl"
+    # The FP16 tree rounds each simdgroup's partial before the final reduction.
+    # On M1 that can move a product-shape BF16 logit by one ULP, while the
+    # FP32-accumulating combo kernel is both more accurate and faster.
+    if _m16_combo_preferred():
+        return "combo_ktmpl"
     if int(K) >= 8192 or int(N) <= 5120:
         return "combo_ktmpl"
     return "super_tree_fp16_ktmpl"
