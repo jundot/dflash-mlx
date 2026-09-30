@@ -123,15 +123,30 @@ def _resolve_draft_quant(draft_quant: str | None) -> DraftQuantSpec | None:
     return parse_draft_quant_spec(spec)
 
 
+def is_dflash2_config(config: dict[str, Any]) -> bool:
+    """Return True for DFlash2 draft checkpoints (conv + selector runtime)."""
+    return "DFlash2DraftModel" in (config.get("architectures") or ())
+
+
 def resolve_draft_load_dtype(
     quant_spec: DraftQuantSpec | None,
     *,
     chip_profile: ChipProfile | None = None,
+    is_dflash2: bool = False,
 ) -> Any | None:
     if quant_spec is None or quant_spec.act_bits == 32:
         return None
     profile = chip_profile or detect_chip()
     if profile.bf16_emulated:
+        # The fp16 cast exists to dodge bf16-emulation slowdown on M1/M2,
+        # but DFlash2's block forward (grouped dynamic convolutions plus
+        # candidate selection) is numerically unstable when the naive cast
+        # also downcasts quantization scales/biases to fp16: outlier
+        # activations overflow and the draft emits all-NaN logits (0%
+        # acceptance; reproduced on 50/50 seeds). Return float16 anyway —
+        # load_draft_bundle then casts via _cast_floating_model_preserving_
+        # quant_metadata, which keeps scales/biases in fp32. DFlash (1)
+        # drafts keep the plain fp16 path, which remains correct for them.
         return mx.float16
     return None
 
@@ -269,8 +284,19 @@ def load_draft_bundle(
     quant_spec = _resolve_draft_quant(draft_quant)
     if quant_spec is not None:
         nn.quantize(model, bits=quant_spec.weight_bits, group_size=quant_spec.group_size)
-        draft_load_dtype = resolve_draft_load_dtype(quant_spec)
-        if draft_load_dtype is not None:
+        draft_load_dtype = resolve_draft_load_dtype(
+            quant_spec,
+            is_dflash2=is_dflash2_config(config),
+        )
+        is_dflash2 = is_dflash2_config(config)
+        if is_dflash2 and draft_load_dtype is not None and bool(mx.float16 == draft_load_dtype):
+            # DFlash2 forwards are fp16-unstable only when the naive cast
+            # also downcasts quantization scales/biases (verified: 50/50
+            # seeds NaN with full cast, 0/30 with metadata preserved).
+            # Keep scales/biases in fp32; weights still get the fp16
+            # bf16-emulation fast path.
+            _cast_floating_model_preserving_quant_metadata(model, mx.float16)
+        elif draft_load_dtype is not None:
             _cast_floating_model(model, draft_load_dtype)
         if quant_spec.act_bits == 32:
 
@@ -321,3 +347,54 @@ def _cast_floating_model(model: Any, dtype: Any) -> None:
         return x
 
     model.apply(_cast)
+
+
+def _cast_floating_model_preserving_quant_metadata(model: Any, dtype: Any) -> None:
+    """Cast floating weights to ``dtype`` but force quant scales/biases to fp32.
+
+    ``nn.quantize`` produces per-group ``scales``/``biases`` next to packed
+    int weights. Downcasting those to fp16 loses the exponent range the
+    dequantized matmul relies on, which is what makes DFlash2 block
+    forwards emit NaN on bf16-emulated (M1/M2) chips. Only ``scales`` and
+    ``biases`` keys are pinned to fp32; everything else floating (weights,
+    norm gains) takes ``dtype`` so the compute-dtype probe in
+    draft_backend picks up the fast path.
+    """
+
+    def _not_quant_meta(module: Any, key: str, value: Any) -> bool:
+        # apply() calls the filter for submodule traversal too: returning
+        # False for a Module/list prunes the whole subtree. Descend into
+        # containers, map only floating arrays that are not quant metadata.
+        if isinstance(value, (type(model), list, dict)):
+            return True
+        if isinstance(value, mx.array):
+            leaf = key.rsplit(".", 1)[-1]
+            return mx.issubdtype(value.dtype, mx.floating) and leaf not in (
+                "scales",
+                "biases",
+            )
+        return False
+
+    def _quant_meta_only(module: Any, key: str, value: Any) -> bool:
+        if isinstance(value, (type(model), list, dict)):
+            return True
+        if isinstance(value, mx.array):
+            leaf = key.rsplit(".", 1)[-1]
+            return mx.issubdtype(value.dtype, mx.floating) and leaf in (
+                "scales",
+                "biases",
+            )
+        return False
+
+    def _cast(x: mx.array) -> mx.array:
+        if mx.issubdtype(x.dtype, mx.floating) and x.dtype != dtype:
+            return x.astype(dtype)
+        return x
+
+    def _cast_f32(x: mx.array) -> mx.array:
+        if mx.issubdtype(x.dtype, mx.floating) and x.dtype != mx.float32:
+            return x.astype(mx.float32)
+        return x
+
+    model.apply(_cast, filter_fn=_not_quant_meta)
+    model.apply(_cast_f32, filter_fn=_quant_meta_only)

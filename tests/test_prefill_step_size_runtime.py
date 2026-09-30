@@ -2004,7 +2004,8 @@ def test_profile_cycle_events_disable_async_prefetch_and_match_summary():
     }
 
 
-def test_adaptive_verify_mode_drops_and_recovers_block_len():
+def test_adaptive_verify_mode_drops_and_recovers_block_len(monkeypatch):
+    monkeypatch.setenv("DFLASH_DISABLE_GEMV_BLOCK_CAP", "1")
     draft_model = _draft_model(block_size=8)
 
     class _PatternTargetOps(_FakeTargetOps):
@@ -2228,7 +2229,8 @@ def test_adaptive_verify_mode_long_context_handoff_starts_block4():
     assert summary.adaptive_block_min == 4
 
 
-def test_adaptive_verify_mode_keeps_full_at_acceptance_boundary():
+def test_adaptive_verify_mode_keeps_full_at_acceptance_boundary(monkeypatch):
+    monkeypatch.setenv("DFLASH_DISABLE_GEMV_BLOCK_CAP", "1")
     draft_model = _draft_model(block_size=8)
 
     class _MixedTargetOps(_FakeTargetOps):
@@ -2410,7 +2412,8 @@ def test_ddtree_verify_mode_selects_branch_candidate():
     assert summary.copyspec_hits == 0
 
 
-def test_ddtree_target_tree_topk_uses_verify_cap_not_full_block():
+def test_ddtree_target_tree_topk_uses_verify_cap_not_full_block(monkeypatch):
+    monkeypatch.setenv("DFLASH_DISABLE_GEMV_BLOCK_CAP", "1")
     class _Embedding:
         def __call__(self, input_ids):
             return input_ids.astype(mx.float32)[..., None]

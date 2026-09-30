@@ -103,3 +103,61 @@ def test_init_target_hidden_handles_chunked_trim():
     assert mx.all(out[:, 2:10, :] == 0.0).item()
 
     assert mx.all(out[:, 10:12, :] == 9.0).item()
+
+
+def test_gemv_verify_block_cap_matches_chip_generation():
+    from types import SimpleNamespace
+
+    from dflash_mlx.engine.config import gemv_verify_block_cap
+
+    def profile(gen, tier="max"):
+        return SimpleNamespace(arch_gen=gen, tier=tier)
+
+    # Unknown chip: no cap.
+    assert gemv_verify_block_cap(profile(0)) == 0
+    # M1/M2 non-Ultra: limit 6 -> block 5 stays on batched GEMV.
+    assert gemv_verify_block_cap(profile(13)) == 5
+    assert gemv_verify_block_cap(profile(14, "base_or_pro")) == 5
+    # M1/M2 Ultra doubles the limit.
+    assert gemv_verify_block_cap(profile(13, "ultra")) == 11
+    # M3/M4/M5.
+    assert gemv_verify_block_cap(profile(15)) == 12
+    assert gemv_verify_block_cap(profile(17)) == 32
+
+
+def test_resolve_speculative_cycle_config_caps_block_on_m1():
+    from types import SimpleNamespace
+
+    from dflash_mlx.engine.config import resolve_speculative_cycle_config
+
+    draft = SimpleNamespace(block_size=8)
+    runtime = SimpleNamespace()
+
+    def profile(gen):
+        return SimpleNamespace(arch_gen=gen, tier="max")
+
+    # M1 (qmv limit 6): a requested block of 6 (verify M=6) falls to the
+    # tiled GEMM; the cap keeps verify at 5 rows (batched GEMV).
+    cfg = resolve_speculative_cycle_config(
+        runtime, draft, 6, chip_profile=profile(13)
+    )
+    assert cfg.requested_block_tokens == 6
+    assert cfg.effective_block_tokens == 5
+
+    # Block 5 (verify M=5) stays inside the GEMV limit untouched.
+    cfg = resolve_speculative_cycle_config(
+        runtime, draft, 5, chip_profile=profile(13)
+    )
+    assert cfg.effective_block_tokens == 5
+
+    # M5 (limit 33): no cap below the requested block.
+    cfg = resolve_speculative_cycle_config(
+        runtime, draft, 8, chip_profile=profile(17)
+    )
+    assert cfg.effective_block_tokens == 8
+
+    # Explicit smaller block is never raised.
+    cfg = resolve_speculative_cycle_config(
+        runtime, draft, 2, chip_profile=profile(13)
+    )
+    assert cfg.effective_block_tokens == 2

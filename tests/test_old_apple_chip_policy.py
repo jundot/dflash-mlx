@@ -226,3 +226,81 @@ def test_load_draft_bundle_preserves_checkpoint_dtype_without_quant(
     assert fake_model.float_value.dtype == mx.bfloat16
     assert meta["draft_load_dtype"] is None
     assert meta["draft_load_dtype_source"] is None
+
+
+def test_dflash2_drafts_keep_fp16_with_fp32_quant_metadata_on_m1():
+    """The naive fp16 cast (which also downcasts quantization scales/biases)
+    makes DFlash2 block forwards emit all-NaN logits on M1/M2 (0% acceptance).
+    DFlash2 therefore loads with scales/biases pinned to fp32 while the rest
+    of the floating weights keep the fp16 fast path; DFlash (1) drafts are
+    unaffected and keep the plain fp16 cast."""
+    quant = runtime_loading.parse_draft_quant_spec("w4")
+
+    # Both draft generations on M1/M2 select fp16 as the load dtype; the
+    # DFlash2 difference is applied at cast time in load_draft_bundle.
+    for architecture in ("applegpu_g13s", "applegpu_g14d"):
+        for is_dflash2 in (True, False):
+            assert (
+                runtime_loading.resolve_draft_load_dtype(
+                    quant,
+                    chip_profile=_profile(architecture),
+                    is_dflash2=is_dflash2,
+                )
+                == mx.float16
+            )
+
+    # bf16-native chips (M3+): no cast at all.
+    assert (
+        runtime_loading.resolve_draft_load_dtype(
+            quant,
+            chip_profile=_profile("applegpu_g15s"),
+            is_dflash2=True,
+        )
+        is None
+    )
+
+
+def test_is_dflash2_config_detects_architecture():
+    assert runtime_loading.is_dflash2_config(
+        {"architectures": ["DFlash2DraftModel"]}
+    )
+    assert not runtime_loading.is_dflash2_config(
+        {"architectures": ["DFlashDraftModel"]}
+    )
+    assert not runtime_loading.is_dflash2_config({})
+
+
+def test_load_draft_bundle_pins_dflash2_scales_to_fp32_on_m1(tmp_path, monkeypatch):
+    import mlx.nn as nn
+
+    class FakeDraftModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(128, 128, bias=False)
+            self.norm = nn.RMSNorm(128)
+            self.is_dflash2 = True
+
+    fake_model = FakeDraftModel()
+    monkeypatch.setattr(
+        runtime_loading,
+        "load_model",
+        lambda *args, **kwargs: (
+            fake_model,
+            {"architectures": ["DFlash2DraftModel"]},
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_loading,
+        "detect_chip",
+        lambda: _profile("applegpu_g13s"),
+    )
+
+    _model, meta = runtime_loading.load_draft_bundle(tmp_path, draft_quant="w4")
+
+    assert meta["draft_load_dtype"] == "float16"
+    assert meta["draft_load_dtype_source"] == "old_apple_bf16_emulation"
+    # Weights take the fp16 fast path...
+    assert fake_model.norm.weight.dtype == mx.float16
+    # ...but quantization metadata stays fp32 (the NaN root cause).
+    assert fake_model.linear.scales.dtype == mx.float32
+    assert fake_model.linear.biases.dtype == mx.float32
