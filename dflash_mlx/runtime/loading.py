@@ -142,6 +142,12 @@ def _dtype_name(dtype: Any | None) -> str | None:
     return str(dtype).rsplit(".", 1)[-1]
 
 
+def _format_draft_quant_spec(spec: DraftQuantSpec | None) -> str | None:
+    if spec is None:
+        return None
+    return f"w{spec.weight_bits}a{spec.act_bits}:gs{spec.group_size}"
+
+
 def _draft_lm_head_weight_names(model_path: Path) -> list[str]:
     index_path = model_path / "model.safetensors.index.json"
     if index_path.exists():
@@ -217,13 +223,15 @@ def load_target_bundle(
         bool(target_capabilities.supports_verify_linear)
         and _verify_enabled_for(verify_config=verify_config)
     )
+    verify_qmm_enabled = _verify_qmm_enabled(verify_config)
     meta["verify_linear_enabled"] = bool(verify_linear_enabled)
+    meta["verify_qmm_enabled"] = bool(verify_qmm_enabled)
     meta["verify_mode"] = (verify_config.mode if verify_config is not None else "env")
     if verify_linear_enabled:
         from dflash_mlx.verify_linear import install_verify_linears
         n_swapped = install_verify_linears(
             model,
-            enable_qmm=_verify_qmm_enabled(verify_config),
+            enable_qmm=verify_qmm_enabled,
         )
         meta["verify_linear_swapped"] = n_swapped
     return LoadedTargetBundle(
@@ -267,9 +275,32 @@ def load_draft_bundle(
         get_model_classes=_get_dflash_model_classes,
     )
     quant_spec = _resolve_draft_quant(draft_quant)
+    requested_quant_spec = quant_spec
+    is_dflash2 = bool(getattr(model, "is_dflash2", False))
+    chip_profile = (
+        detect_chip()
+        if quant_spec is not None and quant_spec.act_bits != 32
+        else None
+    )
+    old_apple_dflash2 = bool(
+        is_dflash2
+        and chip_profile is not None
+        and chip_profile.bf16_emulated
+    )
+    quant_adjustment = None
+    if old_apple_dflash2 and quant_spec is not None and quant_spec.act_bits == 16:
+        quant_spec = DraftQuantSpec(
+            weight_bits=quant_spec.weight_bits,
+            group_size=quant_spec.group_size,
+            act_bits=32,
+        )
+        quant_adjustment = "dflash2_bf16_emulation"
     if quant_spec is not None:
         nn.quantize(model, bits=quant_spec.weight_bits, group_size=quant_spec.group_size)
-        draft_load_dtype = resolve_draft_load_dtype(quant_spec)
+        draft_load_dtype = resolve_draft_load_dtype(
+            quant_spec,
+            chip_profile=chip_profile,
+        )
         if draft_load_dtype is not None:
             _cast_floating_model(model, draft_load_dtype)
         if quant_spec.act_bits == 32:
@@ -286,22 +317,34 @@ def load_draft_bundle(
                 install_verify_linears,
                 prewarm_verify_kernels,
             )
-            install_verify_linears(model, enable_qmm=True)
+            install_verify_linears(
+                model,
+                enable_qmm=True,
+                w4a32_only=quant_spec.act_bits == 32,
+            )
             prewarm_verify_kernels(
                 model,
                 input_dtype=draft_load_dtype or mx.bfloat16,
             )
     else:
         draft_load_dtype = None
+    draft_load_dtype_source = None
+    if quant_adjustment is not None:
+        draft_load_dtype_source = quant_adjustment
+    elif draft_load_dtype is not None and draft_load_dtype == mx.float16:
+        draft_load_dtype_source = "old_apple_bf16_emulation"
     return model, {
         "resolved_model_ref": str(model_ref) if model_ref is not None else str(resolved_ref),
         "config": config,
         "draft_load_dtype": _dtype_name(draft_load_dtype),
-        "draft_load_dtype_source": (
-            "old_apple_bf16_emulation"
-            if draft_load_dtype is not None and draft_load_dtype == mx.float16
-            else None
+        "draft_load_dtype_source": draft_load_dtype_source,
+        "draft_quant_spec": (
+            _format_draft_quant_spec(quant_spec)
+            if quant_adjustment is not None
+            else draft_quant
         ),
+        "draft_quant_adjustment": quant_adjustment,
+        "runtime_block_size": int(getattr(model, "block_size", 1)),
         "draft_quant": (
             {
                 "weight_bits": quant_spec.weight_bits,
@@ -309,6 +352,15 @@ def load_draft_bundle(
                 "act_bits": quant_spec.act_bits,
             }
             if quant_spec is not None
+            else None
+        ),
+        "draft_quant_requested": (
+            {
+                "weight_bits": requested_quant_spec.weight_bits,
+                "group_size": requested_quant_spec.group_size,
+                "act_bits": requested_quant_spec.act_bits,
+            }
+            if requested_quant_spec is not None
             else None
         ),
     }

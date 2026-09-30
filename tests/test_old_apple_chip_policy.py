@@ -140,7 +140,10 @@ def test_load_draft_bundle_casts_quantized_old_apple_floating_tensors(
     monkeypatch.setattr(
         verify_linear,
         "install_verify_linears",
-        lambda model, *, enable_qmm: install_calls.append((model, enable_qmm)) or 0,
+        lambda model, *, enable_qmm, w4a32_only: install_calls.append(
+            (model, enable_qmm, w4a32_only)
+        )
+        or 0,
     )
     monkeypatch.setattr(
         verify_linear,
@@ -154,7 +157,7 @@ def test_load_draft_bundle_casts_quantized_old_apple_floating_tensors(
     assert quant_calls == [(fake_model, 4, 64)]
     assert fake_model.float_value.dtype == mx.float16
     assert fake_model.int_value.dtype == mx.uint32
-    assert install_calls == [(fake_model, True)]
+    assert install_calls == [(fake_model, True, False)]
     assert prewarm_dtypes == [(fake_model, mx.float16)]
     assert meta["draft_load_dtype"] == "float16"
     assert meta["draft_load_dtype_source"] == "old_apple_bf16_emulation"
@@ -174,6 +177,7 @@ def test_load_draft_bundle_casts_w4a32_floating_tensors_to_f32(
             self.int_value = fn(self.int_value)
 
     fake_model = FakeDraftModel()
+    install_calls = []
 
     monkeypatch.setattr(
         runtime_loading,
@@ -186,7 +190,13 @@ def test_load_draft_bundle_casts_w4a32_floating_tensors_to_f32(
         "detect_chip",
         lambda: _profile("applegpu_g13s"),
     )
-    monkeypatch.setattr(verify_linear, "install_verify_linears", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        verify_linear,
+        "install_verify_linears",
+        lambda model, *, enable_qmm, w4a32_only: install_calls.append(
+            (model, enable_qmm, w4a32_only)
+        ),
+    )
     monkeypatch.setattr(verify_linear, "prewarm_verify_kernels", lambda *args, **kwargs: None)
 
     model, meta = runtime_loading.load_draft_bundle(tmp_path, draft_quant="w4a32")
@@ -194,8 +204,69 @@ def test_load_draft_bundle_casts_w4a32_floating_tensors_to_f32(
     assert model is fake_model
     assert fake_model.float_value.dtype == mx.float32
     assert fake_model.int_value.dtype == mx.uint32
+    assert install_calls == [(fake_model, True, True)]
     assert meta["draft_load_dtype"] == "float32"
     assert meta["draft_load_dtype_source"] is None
+
+
+def test_load_draft_bundle_promotes_dflash2_and_reports_runtime_block(
+    tmp_path,
+    monkeypatch,
+):
+    class FakeDFlash2Model:
+        is_dflash2 = True
+        block_size = 8
+
+        def __init__(self):
+            self.float_value = mx.array([1.0], dtype=mx.bfloat16)
+            self.int_value = mx.array([1], dtype=mx.uint32)
+
+        def apply(self, fn):
+            self.float_value = fn(self.float_value)
+            self.int_value = fn(self.int_value)
+
+    fake_model = FakeDFlash2Model()
+    install_calls = []
+
+    monkeypatch.setattr(
+        runtime_loading,
+        "load_model",
+        lambda *args, **kwargs: (fake_model, {"model_type": "qwen3"}),
+    )
+    monkeypatch.setattr(runtime_loading.nn, "quantize", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        runtime_loading,
+        "detect_chip",
+        lambda: _profile("applegpu_g13s"),
+    )
+    monkeypatch.setattr(
+        verify_linear,
+        "install_verify_linears",
+        lambda model, *, enable_qmm, w4a32_only: install_calls.append(
+            (model, enable_qmm, w4a32_only)
+        ),
+    )
+    prewarm_dtypes = []
+    monkeypatch.setattr(
+        verify_linear,
+        "prewarm_verify_kernels",
+        lambda model, *, input_dtype: prewarm_dtypes.append(input_dtype),
+    )
+
+    model, meta = runtime_loading.load_draft_bundle(tmp_path, draft_quant="w4")
+
+    assert model is fake_model
+    assert fake_model.float_value.dtype == mx.float32
+    assert fake_model.int_value.dtype == mx.uint32
+    assert install_calls == [(fake_model, True, True)]
+    assert prewarm_dtypes == [mx.float32]
+    assert meta["draft_load_dtype"] == "float32"
+    assert meta["draft_load_dtype_source"] == "dflash2_bf16_emulation"
+    assert meta["draft_quant_spec"] == "w4a32:gs64"
+    assert meta["draft_quant_adjustment"] == "dflash2_bf16_emulation"
+    assert meta["draft_quant"]["act_bits"] == 32
+    assert meta["draft_quant_requested"]["act_bits"] == 16
+    assert meta["runtime_block_size"] == 8
 
 
 def test_load_draft_bundle_preserves_checkpoint_dtype_without_quant(

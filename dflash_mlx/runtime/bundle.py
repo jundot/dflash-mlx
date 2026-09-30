@@ -89,6 +89,10 @@ def load_runtime_bundle(
         draft_quant=effective_draft_quant,
     )
     draft_meta = dict(draft_meta)
+    effective_draft_quant = draft_meta.get(
+        "draft_quant_spec",
+        effective_draft_quant,
+    )
     draft_meta["draft_quant_spec"] = effective_draft_quant
     draft_meta["draft_quant_source"] = (
         "explicit"
@@ -97,6 +101,19 @@ def load_runtime_bundle(
         if effective_draft_quant is not None
         else "none"
     )
+    draft_logits_w4a32_swapped = 0
+    if (
+        bool(getattr(draft_model, "is_dflash2", False))
+        and draft_meta.get("draft_load_dtype") == "float32"
+    ):
+        from dflash_mlx.verify_linear import install_w4a32_draft_logits_linear
+
+        draft_logits_w4a32_swapped = install_w4a32_draft_logits_linear(
+            target_model,
+            target_ops=target_ops,
+            enable_qmm=bool(target_meta.get("verify_qmm_enabled", False)),
+        )
+    draft_meta["draft_logits_w4a32_swapped"] = draft_logits_w4a32_swapped
     draft_backend = EagerDraftBackend()
     bind_draft_to_target(draft_model, target_model, target_ops=target_ops)
     return RuntimeBundle(

@@ -24,10 +24,13 @@ from dflash_mlx.verify_qmm import (
     _build_kernel_mma2big,
     _build_kernel_mma2big_8bit,
     _build_kernel_m4_ksplit_np,
+    _build_kernel_m8_tuned,
     _build_kernel_mma2big_pipe,
     _build_kernel_mma2big_pipe_8bit,
     _m4_ksplit_np_kparts,
     _m4_ksplit_np_shape,
+    _m8_tuned_config,
+    _m8_w4a32_config,
     _resolve_m16_ktmpl_variant,
 )
 
@@ -95,6 +98,8 @@ class VerifyQuantizedLinear(nn.QuantizedLinear):
         ql: nn.QuantizedLinear,
         *,
         enable_qmm: Optional[bool] = None,
+        w4a32_only: bool = False,
+        enable_bf16_m8: bool = False,
     ) -> "VerifyQuantizedLinear":
         obj = cls.__new__(cls)
         nn.Module.__init__(obj)
@@ -108,7 +113,17 @@ class VerifyQuantizedLinear(nn.QuantizedLinear):
         if "bias" in ql:
             obj.bias = ql.bias
 
-        object.__setattr__(obj, "_call_fn", _build_dispatch(obj, enable_qmm=enable_qmm))
+        object.__setattr__(
+            obj,
+            "_call_fn",
+            _build_dispatch(
+                obj,
+                enable_qmm=enable_qmm,
+                w4a32_only=w4a32_only,
+                enable_bf16_m8=enable_bf16_m8,
+            ),
+        )
+        object.__setattr__(obj, "_w4a32_only", bool(w4a32_only))
 
         obj.freeze()
         return obj
@@ -120,6 +135,8 @@ def _build_dispatch(
     obj: "VerifyQuantizedLinear",
     *,
     enable_qmm: Optional[bool] = None,
+    w4a32_only: bool = False,
+    enable_bf16_m8: bool = False,
 ):
     w = obj.weight
     s = obj.scales
@@ -140,13 +157,25 @@ def _build_dispatch(
     )
 
     ktmpl_variant = _resolve_m16_ktmpl_variant(K, N, bits) if qmm_enabled else None
-    m16_qmm = qmm_enabled and (
+    m16_qmm = qmm_enabled and not w4a32_only and (
         ktmpl_variant is not None
         or (N % 32 == 0 and K % 32 == 0)
     )
-    m4_qmm = qmm_enabled and _m4_ksplit_np_shape(K, N, bits)
+    m4_qmm = qmm_enabled and not w4a32_only and _m4_ksplit_np_shape(K, N, bits)
+    m8_config = (
+        _m8_tuned_config(K, N, bits)
+        if qmm_enabled and (not w4a32_only or enable_bf16_m8)
+        else None
+    )
+    m8_qmm = m8_config is not None
+    m8_w4a32_config = (
+        _m8_w4a32_config(K, N, bits)
+        if qmm_enabled and w4a32_only
+        else None
+    )
+    m8_w4a32_qmm = m8_w4a32_config is not None
 
-    if m16_qmm or m4_qmm:
+    if m16_qmm or m8_qmm or m8_w4a32_qmm or m4_qmm:
         w_c = mx.contiguous(w)
         s_c = mx.contiguous(s)
         b_c = mx.contiguous(b) if b is not None else b
@@ -237,6 +266,58 @@ def _build_dispatch(
             )
             return y
 
+        _m8_variant, m8_n_tile, m8_k_parts = (
+            m8_config if m8_config is not None else ("none", 1, 1)
+        )
+
+        kern_m8_bf16 = (
+            _build_kernel_m8_tuned(gs, mx.bfloat16, K, N, m8_config)
+            if m8_qmm else None
+        )
+        kern_m8_fp16 = (
+            _build_kernel_m8_tuned(gs, mx.float16, K, N, m8_config)
+            if m8_qmm and not w4a32_only else None
+        )
+        _m8_w4a32_variant, m8_w4a32_n_tile, m8_w4a32_k_parts = (
+            m8_w4a32_config
+            if m8_w4a32_config is not None
+            else ("none", 1, 1)
+        )
+        kern_m8_fp32 = (
+            _build_kernel_m8_tuned(gs, mx.float32, K, N, m8_w4a32_config)
+            if m8_w4a32_qmm else None
+        )
+
+        def _run_m8(x2: mx.array, kern) -> mx.array:
+            (y,) = kern(
+                inputs=[x2, w_c, s_c, b_c, K, N],
+                template=[("T", x2.dtype)],
+                grid=(32 * m8_k_parts, N // m8_n_tile, 1),
+                threadgroup=(32 * m8_k_parts, 1, 1),
+                output_shapes=[(8, N)],
+                output_dtypes=[x2.dtype],
+            )
+            return y
+
+        def _run_m8_fp32(x2: mx.array) -> mx.array:
+            (y,) = kern_m8_fp32(
+                inputs=[x2, w_c, s_c, b_c, K, N],
+                template=[("T", x2.dtype)],
+                grid=(32 * m8_w4a32_k_parts, N // m8_w4a32_n_tile, 1),
+                threadgroup=(32 * m8_w4a32_k_parts, 1, 1),
+                output_shapes=[(8, N)],
+                output_dtypes=[mx.float32],
+            )
+            return y
+
+        def _run_m8_fp32_rows(x2: mx.array, rows: int) -> mx.array:
+            if rows < 8:
+                x2 = mx.concatenate(
+                    [x2, mx.zeros((8 - rows, K), dtype=mx.float32)],
+                    axis=0,
+                )
+            return _run_m8_fp32(x2)[:rows]
+
         if has_bias:
             def call(x: mx.array) -> mx.array:
                 orig = x.shape
@@ -265,6 +346,23 @@ def _build_dispatch(
                         y = mx.quantized_matmul(x, w_c, scales=s_c, biases=b_c,
                                                 transpose=True, group_size=gs, bits=bits, mode=mode)
                     return y.reshape(*orig[:-1], N) + bias
+                if m == 8 and m8_qmm:
+                    x2 = mx.contiguous(x.reshape(8, orig[-1]))
+                    dtype = x2.dtype
+                    if dtype == mx.bfloat16:
+                        y = _run_m8(x2, kern_m8_bf16)
+                    elif dtype == mx.float16 and not w4a32_only:
+                        y = _run_m8(x2, kern_m8_fp16)
+                    elif dtype == mx.float32 and m8_w4a32_qmm:
+                        y = _run_m8_fp32(x2)
+                    else:
+                        y = mx.quantized_matmul(x, w_c, scales=s_c, biases=b_c,
+                                                transpose=True, group_size=gs, bits=bits, mode=mode)
+                    return y.reshape(*orig[:-1], N) + bias
+                if m == 7 and m8_w4a32_qmm and x.dtype == mx.float32:
+                    x2 = mx.contiguous(x.reshape(7, orig[-1]))
+                    y = _run_m8_fp32_rows(x2, 7)
+                    return y.reshape(*orig[:-1], N) + bias
                 y = mx.quantized_matmul(x, w_c, scales=s_c, biases=b_c,
                                         transpose=True, group_size=gs, bits=bits, mode=mode)
                 return y + bias
@@ -288,6 +386,18 @@ def _build_dispatch(
                         return _run_m4(x2, kern_m4_bf16).reshape(*orig[:-1], N)
                     if dtype == mx.float16:
                         return _run_m4(x2, kern_m4_fp16).reshape(*orig[:-1], N)
+                if m == 8 and m8_qmm:
+                    x2 = mx.contiguous(x.reshape(8, orig[-1]))
+                    dtype = x2.dtype
+                    if dtype == mx.bfloat16:
+                        return _run_m8(x2, kern_m8_bf16).reshape(*orig[:-1], N)
+                    if dtype == mx.float16 and not w4a32_only:
+                        return _run_m8(x2, kern_m8_fp16).reshape(*orig[:-1], N)
+                    if dtype == mx.float32 and m8_w4a32_qmm:
+                        return _run_m8_fp32(x2).reshape(*orig[:-1], N)
+                if m == 7 and m8_w4a32_qmm and x.dtype == mx.float32:
+                    x2 = mx.contiguous(x.reshape(7, orig[-1]))
+                    return _run_m8_fp32_rows(x2, 7).reshape(*orig[:-1], N)
                 return mx.quantized_matmul(x, w_c, scales=s_c, biases=b_c,
                                            transpose=True, group_size=gs, bits=bits, mode=mode)
         return call
@@ -332,12 +442,21 @@ def prewarm_verify_kernels(
         if key in seen:
             continue
         seen.add(key)
+        if bool(getattr(m, "_w4a32_only", False)):
+            dummy_m8 = mx.zeros((1, 8, K), dtype=mx.float32)
+            mx.eval(m(dummy_m8))
+            warmed += 1
+            continue
         dummy = mx.zeros((1, 16, K), dtype=input_dtype)
         mx.eval(m(dummy))
         warmed += 1
         if _m4_ksplit_np_shape(K, N, m.bits):
             dummy_m4 = mx.zeros((1, 4, K), dtype=input_dtype)
             mx.eval(m(dummy_m4))
+            warmed += 1
+        if _m8_tuned_config(K, N, m.bits) is not None:
+            dummy_m8 = mx.zeros((1, 8, K), dtype=input_dtype)
+            mx.eval(m(dummy_m8))
             warmed += 1
     return warmed
 
@@ -346,6 +465,7 @@ def install_verify_linears(
     *,
     predicate: Optional[Callable[[str, nn.QuantizedLinear], bool]] = None,
     enable_qmm: Optional[bool] = None,
+    w4a32_only: bool = False,
 ) -> int:
     if predicate is None:
         predicate = lambda path, m: is_verify_eligible(m, path=path)
@@ -358,10 +478,64 @@ def install_verify_linears(
             return m
         if isinstance(m, nn.QuantizedLinear) and predicate(path, m):
             count += 1
-            return VerifyQuantizedLinear.from_quantized(m, enable_qmm=enable_qmm)
+            return VerifyQuantizedLinear.from_quantized(
+                m,
+                enable_qmm=enable_qmm,
+                w4a32_only=w4a32_only,
+            )
         return m
 
     leaves = model.leaf_modules()
     leaves = tree_map_with_path(_maybe_swap, leaves, is_leaf=nn.Module.is_module)
     model.update_modules(leaves)
     return count
+
+
+def install_w4a32_draft_logits_linear(
+    target_model,
+    *,
+    target_ops,
+    enable_qmm: bool,
+) -> int:
+    """Install the DFlash2-specific M=7/M=8 vocabulary projections.
+
+    The wrapper accelerates the FP32 M=7 draft projection and BF16 M=8 target
+    verification. Every other shape and dtype stays on stock MLX QMM, keeping
+    ordinary target decoding unchanged. The one missing draft row is
+    zero-padded inside the wrapper to reuse the profiled M=8 matrix kernel.
+    """
+    if not enable_qmm:
+        return 0
+    try:
+        wrapper = target_ops.text_wrapper(target_model)
+    except (AttributeError, TypeError):
+        return 0
+    if bool(getattr(getattr(wrapper, "args", None), "tie_word_embeddings", True)):
+        return 0
+    linear = getattr(wrapper, "lm_head", None)
+    if not isinstance(linear, nn.QuantizedLinear):
+        return 0
+    if isinstance(linear, VerifyQuantizedLinear):
+        return 0
+    if (
+        getattr(linear, "bits", None) != 4
+        or getattr(linear, "group_size", None) not in (32, 64, 128)
+        or getattr(linear, "mode", "affine") != "affine"
+    ):
+        return 0
+    K = int(linear.weight.shape[1]) * 8
+    N = int(linear.weight.shape[0])
+    if _m8_w4a32_config(K, N, 4) is None:
+        return 0
+
+    replacement = VerifyQuantizedLinear.from_quantized(
+        linear,
+        enable_qmm=True,
+        w4a32_only=True,
+        enable_bf16_m8=True,
+    )
+    wrapper.lm_head = replacement
+    draft_dummy = mx.zeros((1, 7, K), dtype=mx.float32)
+    target_dummy = mx.zeros((1, 8, K), dtype=mx.bfloat16)
+    mx.eval(replacement(draft_dummy), replacement(target_dummy))
+    return 1
