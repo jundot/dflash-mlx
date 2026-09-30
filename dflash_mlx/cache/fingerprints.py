@@ -16,4 +16,6 @@ class DFlashPrefixKey:
     template_hash: str
     prompt_policy_hash: str
     target_fa_window: int = 0
-    format_version: int = 3
+    # 4: target GDN verify follows mlx-lm normalize_qk, so older snapshots
+    # no longer match a fresh prefill.
+    format_version: int = 4

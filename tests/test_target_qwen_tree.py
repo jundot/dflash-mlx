@@ -459,3 +459,38 @@ def test_qwen_hybrid_tree_commit_gathers_accepted_sibling_path_cache():
     )
 
     _assert_close(tree_next, sequential_next, atol=7e-3)
+
+
+def test_qwen_hybrid_armed_verify_normalizes_qk_like_stock():
+    model = _tiny_qwen35_hybrid_model()
+    # Tiny k rows make the l2norm eps visible in the logits.
+    for layer in model.language_model.model.layers:
+        if not getattr(layer, "is_linear", False):
+            continue
+        gdn = layer.linear_attn
+        rows = mx.arange(gdn.in_proj_qkv.weight.shape[0])
+        k_rows = (rows >= gdn.key_dim) & (rows < 2 * gdn.key_dim)
+        gdn.in_proj_qkv.weight = gdn.in_proj_qkv.weight * mx.where(
+            k_rows, 1e-3, 1.0
+        )[:, None]
+    ops = QwenGdnTargetOps()
+    prompt = mx.array([[1, 2, 3]], dtype=mx.uint32)
+    verify_ids = mx.array([[4, 5]], dtype=mx.uint32)
+
+    armed_cache = _prefilled_cache(model, ops, prompt)
+    stock_cache = _prefilled_cache(model, ops, prompt)
+    ops.arm_rollback(armed_cache, prefix_len=int(prompt.shape[1]))
+
+    armed_logits, _ = ops.verify_block(
+        target_model=model,
+        verify_ids=verify_ids,
+        target_cache=armed_cache,
+        capture_layer_ids={1, 2},
+    )
+    stock_logits, _ = ops.verify_block(
+        target_model=model,
+        verify_ids=verify_ids,
+        target_cache=stock_cache,
+        capture_layer_ids={1, 2},
+    )
+    _assert_close(armed_logits, stock_logits)

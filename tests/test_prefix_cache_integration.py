@@ -214,7 +214,7 @@ class TestServeHelperShapes:
         assert key.capture_layer_ids == (3, 7)
         assert isinstance(key.draft_sink_size, int)
         assert isinstance(key.draft_window_size, int)
-        assert key.format_version == 3
+        assert key.format_version == 4
         assert len(key.template_hash) == 64
         assert len(key.prompt_policy_hash) == 64
 

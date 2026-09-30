@@ -34,6 +34,21 @@ _TREE_PREFIX_LEN_ATTR = "_dflash_tree_prefix_len"
 _TREE_SIZE_ATTR = "_dflash_tree_size"
 
 
+def _normalize_gdn_qk(q: mx.array, k: mx.array) -> tuple[mx.array, mx.array]:
+    """Normalize q/k like the stock GatedDeltaNet of the installed mlx-lm.
+
+    mlx-lm with ``normalize_qk`` scales the l2norm eps by ``inv_scale**2``;
+    older releases pass 1e-6 to rms_norm directly.
+    """
+    inv_scale = k.shape[-1] ** -0.5
+    normalize_qk = getattr(gated_delta_mod, "normalize_qk", None)
+    if normalize_qk is not None:
+        return normalize_qk(q, k, inv_scale=inv_scale, eps=1e-6)
+    q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+    k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+    return q, k
+
+
 def _int_attr(obj: Any, name: str) -> int:
     value = getattr(obj, name, 0)
     if value is None:
@@ -338,9 +353,7 @@ def _tree_recurrent_call(
     ]
 
     state = cache[1]
-    inv_scale = k.shape[-1] ** -0.5
-    q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-    k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+    q, k = _normalize_gdn_qk(q, k)
     g = gated_delta_mod.compute_g(linear_attn.A_log, a, linear_attn.dt_bias)
     beta = mx.sigmoid(b)
 
@@ -594,9 +607,7 @@ def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
         ]
 
         state = cache[1]
-        inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        q, k = _normalize_gdn_qk(q, k)
         g = gated_delta_mod.compute_g(self.A_log, a, self.dt_bias)
         beta = mx.sigmoid(b)
 
